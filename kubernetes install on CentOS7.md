@@ -487,7 +487,3 @@ Created symlink from /etc/systemd/system/multi-user.target.wants/kube-proxy.serv
 [root@k8s-node1 ~]# kubectl get nodes
 NAME        STATUS    AGE
 k8s-node1   Ready     9m
-
-
-
-
