@@ -1,0 +1,659 @@
+##rc文件
+    [root@k8smaster zhuyr]# cat skydns-rc.yaml 
+    apiVersion: v1
+    kind: ReplicationController
+    metadata:
+      name: kube-dns-v11
+      namespace: kube-system
+      labels:
+        k8s-app: kube-dns
+        version: v11
+        kubernetes.io/cluster-service: "true"
+    spec:
+      replicas: 1
+      selector:
+        k8s-app: kube-dns
+        version: v11
+      template:
+        metadata:
+          labels:
+            k8s-app: kube-dns
+            version: v11
+            kubernetes.io/cluster-service: "true"
+        spec:
+          containers:
+          - name: etcd
+            image: gcr.io/google_containers/etcd-amd64:2.2.1
+            securityContext:
+              privileged: true
+            resources:
+              limits:
+                cpu: 100m
+                memory: 50Mi
+              requests:
+                cpu: 100m
+                memory: 50Mi
+            command:
+            - /usr/local/bin/etcd
+            - -data-dir
+            - /tmp/data
+            - -listen-client-urls
+            - http://127.0.0.1:2379,http://127.0.0.1:4001
+            - -advertise-client-urls
+            - http://127.0.0.1:2379,http://127.0.0.1:4001
+            - -initial-cluster-token
+            - skydns-etcd
+            volumeMounts:
+            - name: etcd-storage
+              mountPath: /tmp/data
+          - name: kube2sky
+            image: gcr.io/google_containers/kube2sky:1.15
+            securityContext:
+              privileged: true
+            resources:
+              limits:
+                cpu: 100m
+                memory: 50Mi
+              requests:
+                cpu: 100m
+                memory: 50Mi
+            livenessProbe:
+              httpGet:
+                path: /healthz
+                port: 8080
+                scheme: HTTP
+              initialDelaySeconds: 60
+              timeoutSeconds: 5
+              successThreshold: 1
+              failureThreshold: 5
+            readinessProbe:
+              httpGet:
+                path: /readiness
+                port: 8081
+                scheme: HTTP
+              initialDelaySeconds: 30
+              timeoutSeconds: 5
+            args:
+            - --kube-master-url=http://172.16.160.205:8080
+            - --domain=cluster.local
+          - name: skydns
+            image: gcr.io/google_containers/skydns:2015-10-13-8c72f8c
+            securityContext:
+              privileged: true
+            resources:
+              limits:
+                cpu: 100m
+                memory: 50Mi
+              requests:
+                cpu: 100m
+                memory: 50Mi
+            args:
+            - -machines=http://127.0.0.1:4001
+            - -addr=0.0.0.0:53
+            - -ns-rotate=false
+            - -domain=cluster.local
+            ports:
+            - containerPort: 53
+              name: dns
+              protocol: UDP
+            - containerPort: 53
+              name: dns-tcp
+              protocol: TCP
+          - name: healthz
+            image: gcr.io/google_containers/exechealthz:1.0
+            securityContext:
+              privileged: true
+            resources:
+              limits:
+                cpu: 10m
+                memory: 20Mi
+              requests:
+                cpu: 10m
+                memory: 20Mi
+            args:
+            - -cmd=nslookup kubernetes.default.svc.cluster.local 127.0.0.1 >/dev/null
+            - -port=8080
+            ports:
+            - containerPort: 8080
+              protocol: TCP
+          volumes:
+          - name: etcd-storage
+            emptyDir: {}
+          dnsPolicy: Default  # Don't use cluster DNS.
+    [root@k8smaster zhuyr]# 
+
+
+
+##svc文件
+
+    [root@k8smaster zhuyr]# cat skydns-svc.yaml 
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: kube-dns
+      namespace: kube-system
+      labels:
+        k8s-app: kube-dns
+        kubernetes.io/cluster-service: "true"
+        kubernetes.io/name: "KubeDNS"
+    spec:
+      selector:
+        k8s-app: kube-dns
+      clusterIP: 172.20.0.10
+      ports:
+      - name: dns
+        port: 53
+        protocol: UDP
+      - name: dns-tcp
+        port: 53
+        protocol: TCP
+    [root@k8smaster zhuyr]# 
+##apiserver和kubelet都要改成允许特权访问
+    [root@k8smaster zhuyr]# cat /etc/kubernetes/config
+    KUBE_LOGTOSTDERR="--logtostderr=true"
+    KUBE_LOG_LEVEL="--v=0"
+    KUBE_ALLOW_PRIV="--allow-privileged=true"
+    #KUBE_ALLOW_PRIV="--allow-privileged=false"
+    KUBE_MASTER="--master=http://172.16.160.205:8080"
+    KUBE_ETCD_SERVERS="--etcd-servers=http://172.16.160.205:2379"  
+    [root@k8smaster zhuyr]# 
+
+##查看DNS
+
+    [root@k8smaster zhuyr]# kubectl cluster-info
+    Kubernetes master is running at http://localhost:8080
+    KubeDNS is running at http://localhost:8080/api/v1/proxy/namespaces/kube-system/services/kube-dns
+    
+    To further debug and diagnose cluster problems, use 'kubectl cluster-info dump'.
+
+
+##查看SVC
+
+    [root@k8smaster zhuyr]# kubectl get svc -o wide --all-namespaces 
+    NAMESPACE     NAME                   CLUSTER-IP     EXTERNAL-IP   PORT(S)         AGE       SELECTOR
+    default       kubernetes             172.20.0.1     <none>        443/TCP         6d        <none>
+    kube-system   kube-dns               172.20.0.10    <none>        53/UDP,53/TCP   6s        k8s-app=kube-dns
+    [root@k8smaster zhuyr]# 
+
+##查看PODS
+
+    [root@k8smaster zhuyr]# kubectl get pods -o wide --all-namespaces 
+    NAMESPACE     NAME                                    READY     STATUS             RESTARTS   AGE       IP          NODE
+    kube-system   kube-dns-v11-lf68f                      4/4       Running            0          59s       10.1.75.2   k8smaster
+    [root@k8smaster zhuyr]# 
+
+
+
+##查看POD信息
+
+    [root@k8smaster zhuyr]# kubectl describe pod kube-dns-v11-lf68f --namespace=kube-system
+    Name:           kube-dns-v11-lf68f
+    Namespace:      kube-system
+    Node:           k8smaster/172.16.160.205
+    Start Time:     Fri, 10 Mar 2017 09:45:35 +0800
+    Labels:         k8s-app=kube-dns
+                    kubernetes.io/cluster-service=true
+                    version=v11
+    Status:         Running
+    IP:             10.1.75.2
+    Controllers:    ReplicationController/kube-dns-v11
+    Containers:
+      etcd:
+        Container ID:       docker://dfded0b848f1d73cc144efe902a0d00b57824f5832ee141ae4482382ccb40326
+        Image:              gcr.io/google_containers/etcd-amd64:2.2.1
+        Image ID:           docker-pullable://gcr.io/google_containers/etcd-amd64@sha256:94573e18def7a39c277a3b088b4d5332c3f68492bb73ac66f7f93c12cdd1356c
+        Port:
+        Command:
+          /usr/local/bin/etcd
+          -data-dir
+          /tmp/data
+          -listen-client-urls
+          http://127.0.0.1:2379,http://127.0.0.1:4001
+          -advertise-client-urls
+          http://127.0.0.1:2379,http://127.0.0.1:4001
+          -initial-cluster-token
+          skydns-etcd
+        Limits:
+          cpu:      100m
+          memory:   50Mi
+        Requests:
+          cpu:              100m
+          memory:           50Mi
+        State:              Running
+          Started:          Fri, 10 Mar 2017 09:45:35 +0800
+        Ready:              True
+        Restart Count:      0
+        Volume Mounts:
+          /tmp/data from etcd-storage (rw)
+          /var/run/secrets/kubernetes.io/serviceaccount from default-token-sk1sc (ro)
+        Environment Variables:      <none>
+      kube2sky:
+        Container ID:       docker://bffbf4c92979b748467706abee745b14849431815a7a0f3fc859669118fb965e
+        Image:              gcr.io/google_containers/kube2sky:1.15
+        Image ID:           docker-pullable://gcr.io/google_containers/kube2sky@sha256:74fae1a270d3b84c36f620f425abba6a6744707671e64974e13fc3585adcea5b
+        Port:
+        Args:
+          --kube-master-url=http://172.16.160.205:8080
+          --domain=cluster.local
+        Limits:
+          cpu:      100m
+          memory:   50Mi
+        Requests:
+          cpu:              100m
+          memory:           50Mi
+        State:              Running
+          Started:          Fri, 10 Mar 2017 09:45:36 +0800
+        Ready:              True
+        Restart Count:      0
+        Liveness:           http-get http://:8080/healthz delay=60s timeout=5s period=10s #success=1 #failure=5
+        Readiness:          http-get http://:8081/readiness delay=30s timeout=5s period=10s #success=1 #failure=3
+        Volume Mounts:
+          /var/run/secrets/kubernetes.io/serviceaccount from default-token-sk1sc (ro)
+        Environment Variables:      <none>
+      skydns:
+        Container ID:       docker://703dba1eb901ea38a04d297afcb4f701732beba069850f6bb53f31c16b33f163
+        Image:              gcr.io/google_containers/skydns:2015-10-13-8c72f8c
+        Image ID:           docker-pullable://gcr.io/google_containers/skydns@sha256:c0b60a61dc95318819a50fbad54b32545694b9c7a40a1b8f97417bf777014338
+        Ports:              53/UDP, 53/TCP
+        Args:
+          -machines=http://127.0.0.1:4001
+          -addr=0.0.0.0:53
+          -ns-rotate=false
+          -domain=cluster.local
+        Limits:
+          cpu:      100m
+          memory:   50Mi
+        Requests:
+          cpu:              100m
+          memory:           50Mi
+        State:              Running
+          Started:          Fri, 10 Mar 2017 09:45:36 +0800
+        Ready:              True
+        Restart Count:      0
+        Volume Mounts:
+          /var/run/secrets/kubernetes.io/serviceaccount from default-token-sk1sc (ro)
+        Environment Variables:      <none>
+      healthz:
+        Container ID:       docker://cde3b286b30b842ea45ec9854486cb63d79e2171ae7f68263b0e0441a6b43360
+        Image:              gcr.io/google_containers/exechealthz:1.0
+        Image ID:           docker-pullable://gcr.io/google_containers/exechealthz@sha256:ad5b6a74cc08db2b9ac0dffd3d49001e8ebd792797141165fbe939d9fededa9e
+        Port:               8080/TCP
+        Args:
+          -cmd=nslookup kubernetes.default.svc.cluster.local 127.0.0.1 >/dev/null
+          -port=8080
+        Limits:
+          cpu:      10m
+          memory:   20Mi
+        Requests:
+          cpu:              10m
+          memory:           20Mi
+        State:              Running
+          Started:          Fri, 10 Mar 2017 09:45:36 +0800
+        Ready:              True
+        Restart Count:      0
+        Volume Mounts:
+          /var/run/secrets/kubernetes.io/serviceaccount from default-token-sk1sc (ro)
+        Environment Variables:      <none>
+    Conditions:
+      Type          Status
+      Initialized   True 
+      Ready         True 
+      PodScheduled  True 
+    Volumes:
+      etcd-storage:
+        Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+        Medium:
+      default-token-sk1sc:
+        Type:       Secret (a volume populated by a Secret)
+        SecretName: default-token-sk1sc
+    QoS Class:      Guaranteed
+    Tolerations:    <none>
+    Events:
+      FirstSeen     LastSeen        Count   From                    SubObjectPath                   Type            Reason          Message
+      ---------     --------        -----   ----                    -------------                   --------        ------          -------
+      27m           27m             1       {default-scheduler }                                    Normal          Scheduled       Successfully assigned kube-dns-v11-lf68f to k8smaster
+      27m           27m             1       {kubelet k8smaster}     spec.containers{etcd}           Normal          Pulled          Container image "gcr.io/google_containers/etcd-amd64:2.2.1" already present on machine
+      27m           27m             1       {kubelet k8smaster}     spec.containers{etcd}           Normal          Created         Created container with docker id dfded0b848f1; Security:[seccomp=unconfined]
+      27m           27m             1       {kubelet k8smaster}     spec.containers{kube2sky}       Normal          Started         Started container with docker id bffbf4c92979
+      27m           27m             1       {kubelet k8smaster}     spec.containers{kube2sky}       Normal          Pulled          Container image "gcr.io/google_containers/kube2sky:1.15" already present on machine
+      27m           27m             1       {kubelet k8smaster}     spec.containers{kube2sky}       Normal          Created         Created container with docker id bffbf4c92979; Security:[seccomp=unconfined]
+      27m           27m             1       {kubelet k8smaster}     spec.containers{etcd}           Normal          Started         Started container with docker id dfded0b848f1
+      27m           27m             1       {kubelet k8smaster}     spec.containers{skydns}         Normal          Pulled          Container image "gcr.io/google_containers/skydns:2015-10-13-8c72f8c" already present on machine
+      27m           27m             1       {kubelet k8smaster}     spec.containers{skydns}         Normal          Created         Created container with docker id 703dba1eb901; Security:[seccomp=unconfined]
+      27m           27m             1       {kubelet k8smaster}     spec.containers{skydns}         Normal          Started         Started container with docker id 703dba1eb901
+      27m           27m             1       {kubelet k8smaster}     spec.containers{healthz}        Normal          Pulled          Container image "gcr.io/google_containers/exechealthz:1.0" already present on machine
+      27m           27m             1       {kubelet k8smaster}     spec.containers{healthz}        Normal          Created         Created container with docker id cde3b286b30b; Security:[seccomp=unconfined]
+      27m           27m             1       {kubelet k8smaster}     spec.containers{healthz}        Normal          Started         Started container with docker id cde3b286b30b
+    [root@k8smaster zhuyr]# 
+##查看yaml
+
+    [root@k8smaster ~]# kubectl get pod kube-dns-v11-lf68f --namespace=kube-system -o yaml
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      annotations:
+        kubernetes.io/created-by: |
+          {"kind":"SerializedReference","apiVersion":"v1","reference":{"kind":"ReplicationController","namespace":"kube-system","name":"kube-dns-v11","uid":"411bee46-0533-11e7-9086-005056b1ced4","apiVersion":"v1","resourceVersion":"695372"}}
+      creationTimestamp: 2017-03-10T01:45:35Z
+      generateName: kube-dns-v11-
+      labels:
+        k8s-app: kube-dns
+        kubernetes.io/cluster-service: "true"
+        version: v11
+      name: kube-dns-v11-lf68f
+      namespace: kube-system
+      ownerReferences:
+      - apiVersion: v1
+        controller: true
+        kind: ReplicationController
+        name: kube-dns-v11
+        uid: 411bee46-0533-11e7-9086-005056b1ced4
+      resourceVersion: "695455"
+      selfLink: /api/v1/namespaces/kube-system/pods/kube-dns-v11-lf68f
+      uid: 411cb6f0-0533-11e7-9086-005056b1ced4
+    spec:
+      containers:
+      - command:
+        - /usr/local/bin/etcd
+        - -data-dir
+        - /tmp/data
+        - -listen-client-urls
+        - http://127.0.0.1:2379,http://127.0.0.1:4001
+        - -advertise-client-urls
+        - http://127.0.0.1:2379,http://127.0.0.1:4001
+        - -initial-cluster-token
+        - skydns-etcd
+        image: gcr.io/google_containers/etcd-amd64:2.2.1
+        imagePullPolicy: IfNotPresent
+        name: etcd
+        resources:
+          limits:
+            cpu: 100m
+            memory: 50Mi
+          requests:
+            cpu: 100m
+            memory: 50Mi
+        securityContext:
+          privileged: true
+        terminationMessagePath: /dev/termination-log
+        volumeMounts:
+        - mountPath: /tmp/data
+          name: etcd-storage
+        - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          name: default-token-sk1sc
+          readOnly: true
+      - args:
+        - --kube-master-url=http://172.16.160.205:8080
+        - --domain=cluster.local
+        image: gcr.io/google_containers/kube2sky:1.15
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 5
+          httpGet:
+            path: /healthz
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: kube2sky
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /readiness
+            port: 8081
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: 100m
+            memory: 50Mi
+          requests:
+            cpu: 100m
+            memory: 50Mi
+        securityContext:
+          privileged: true
+        terminationMessagePath: /dev/termination-log
+        volumeMounts:
+        - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          name: default-token-sk1sc
+          readOnly: true
+      - args:
+        - -machines=http://127.0.0.1:4001
+        - -addr=0.0.0.0:53
+        - -ns-rotate=false
+        - -domain=cluster.local
+        image: gcr.io/google_containers/skydns:2015-10-13-8c72f8c
+        imagePullPolicy: IfNotPresent
+        name: skydns
+        ports:
+        - containerPort: 53
+          name: dns
+          protocol: UDP
+        - containerPort: 53
+          name: dns-tcp
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 100m
+            memory: 50Mi
+          requests:
+            cpu: 100m
+            memory: 50Mi
+        securityContext:
+          privileged: true
+        terminationMessagePath: /dev/termination-log
+        volumeMounts:
+        - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          name: default-token-sk1sc
+          readOnly: true
+      - args:
+        - -cmd=nslookup kubernetes.default.svc.cluster.local 127.0.0.1 >/dev/null
+        - -port=8080
+        image: gcr.io/google_containers/exechealthz:1.0
+        imagePullPolicy: IfNotPresent
+        name: healthz
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 10m
+            memory: 20Mi
+          requests:
+            cpu: 10m
+            memory: 20Mi
+        securityContext:
+          privileged: true
+        terminationMessagePath: /dev/termination-log
+        volumeMounts:
+        - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          name: default-token-sk1sc
+          readOnly: true
+      dnsPolicy: Default
+      nodeName: k8smaster
+      restartPolicy: Always
+      securityContext: {}
+      serviceAccount: default
+      serviceAccountName: default
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - emptyDir: {}
+        name: etcd-storage
+      - name: default-token-sk1sc
+        secret:
+          defaultMode: 420
+          secretName: default-token-sk1sc
+    status:
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: 2017-03-10T01:45:35Z
+        status: "True"
+        type: Initialized
+      - lastProbeTime: null
+        lastTransitionTime: 2017-03-10T01:46:15Z
+        status: "True"
+        type: Ready
+      - lastProbeTime: null
+        lastTransitionTime: 2017-03-10T01:45:35Z
+        status: "True"
+        type: PodScheduled
+      containerStatuses:
+      - containerID: docker://dfded0b848f1d73cc144efe902a0d00b57824f5832ee141ae4482382ccb40326
+        image: gcr.io/google_containers/etcd-amd64:2.2.1
+        imageID: docker-pullable://gcr.io/google_containers/etcd-amd64@sha256:94573e18def7a39c277a3b088b4d5332c3f68492bb73ac66f7f93c12cdd1356c
+        lastState: {}
+        name: etcd
+        ready: true
+        restartCount: 0
+        state:
+          running:
+            startedAt: 2017-03-10T01:45:35Z
+      - containerID: docker://cde3b286b30b842ea45ec9854486cb63d79e2171ae7f68263b0e0441a6b43360
+        image: gcr.io/google_containers/exechealthz:1.0
+        imageID: docker-pullable://gcr.io/google_containers/exechealthz@sha256:ad5b6a74cc08db2b9ac0dffd3d49001e8ebd792797141165fbe939d9fededa9e
+        lastState: {}
+        name: healthz
+        ready: true
+        restartCount: 0
+        state:
+          running:
+            startedAt: 2017-03-10T01:45:36Z
+      - containerID: docker://bffbf4c92979b748467706abee745b14849431815a7a0f3fc859669118fb965e
+        image: gcr.io/google_containers/kube2sky:1.15
+        imageID: docker-pullable://gcr.io/google_containers/kube2sky@sha256:74fae1a270d3b84c36f620f425abba6a6744707671e64974e13fc3585adcea5b
+        lastState: {}
+        name: kube2sky
+        ready: true
+        restartCount: 0
+        state:
+          running:
+            startedAt: 2017-03-10T01:45:36Z
+      - containerID: docker://703dba1eb901ea38a04d297afcb4f701732beba069850f6bb53f31c16b33f163
+        image: gcr.io/google_containers/skydns:2015-10-13-8c72f8c
+        imageID: docker-pullable://gcr.io/google_containers/skydns@sha256:c0b60a61dc95318819a50fbad54b32545694b9c7a40a1b8f97417bf777014338
+        lastState: {}
+        name: skydns
+        ready: true
+        restartCount: 0
+        state:
+          running:
+            startedAt: 2017-03-10T01:45:36Z
+      hostIP: 172.16.160.205
+      phase: Running
+      podIP: 10.1.75.2
+      startTime: 2017-03-10T01:45:35Z
+    [root@k8smaster ~]# 
+
+##查看docker容器
+
+    [root@k8smaster zhuyr]# docker ps -a
+    CONTAINER ID        IMAGE                                                COMMAND                  CREATED             STATUS                  PORTS               NAMES
+    cde3b286b30b        gcr.io/google_containers/exechealthz:1.0             "/exechealthz '-cm..."   59 minutes ago      Up 59 minutes                               k8s_healthz.6a8c73_kube-dns-v11-lf68f_kube-system_411cb6f0-0533-11e7-9086-005056b1ced4_7c968353
+    703dba1eb901        gcr.io/google_containers/skydns:2015-10-13-8c72f8c   "/skydns -machines..."   59 minutes ago      Up 59 minutes                               k8s_skydns.49cfb3ec_kube-dns-v11-lf68f_kube-system_411cb6f0-0533-11e7-9086-005056b1ced4_bd76a8c4
+    bffbf4c92979        gcr.io/google_containers/kube2sky:1.15               "/kube2sky --kube-..."   59 minutes ago      Up 59 minutes                               k8s_kube2sky.c5cd89c6_kube-dns-v11-lf68f_kube-system_411cb6f0-0533-11e7-9086-005056b1ced4_f565528f
+    dfded0b848f1        gcr.io/google_containers/etcd-amd64:2.2.1            "/usr/local/bin/et..."   59 minutes ago      Up 59 minutes                               k8s_etcd.16dcaf50_kube-dns-v11-lf68f_kube-system_411cb6f0-0533-11e7-9086-005056b1ced4_918ccfdc
+    b8b0eaef5c9e        gcr.io/google_containers/pause-amd64:3.0             "/pause"                 59 minutes ago      Up 59 minutes                               k8s_POD.72f34cbf_kube-dns-v11-lf68f_kube-system_411cb6f0-0533-11e7-9086-005056b1ced4_67536f82
+    [root@k8smaster zhuyr]# docker exec -it cde3b286b30b netstat -tln
+    Active Internet connections (only servers)
+    Proto Recv-Q Send-Q Local Address           Foreign Address         State       
+    tcp        0      0 127.0.0.1:4001          0.0.0.0:*               LISTEN      
+    tcp        0      0 127.0.0.1:2379          0.0.0.0:*               LISTEN      
+    tcp        0      0 127.0.0.1:2380          0.0.0.0:*               LISTEN      
+    tcp        0      0 127.0.0.1:7001          0.0.0.0:*               LISTEN      
+    tcp        0      0 :::8080                 :::*                    LISTEN      
+    tcp        0      0 :::8081                 :::*                    LISTEN      
+    tcp        0      0 :::53                   :::*                    LISTEN      
+    [root@k8smaster zhuyr]# docker exec -it 703dba1eb901 netstat -tln
+    Active Internet connections (only servers)
+    Proto Recv-Q Send-Q Local Address           Foreign Address         State       
+    tcp        0      0 127.0.0.1:4001          0.0.0.0:*               LISTEN      
+    tcp        0      0 127.0.0.1:2379          0.0.0.0:*               LISTEN      
+    tcp        0      0 127.0.0.1:2380          0.0.0.0:*               LISTEN      
+    tcp        0      0 127.0.0.1:7001          0.0.0.0:*               LISTEN      
+    [root@k8smaster zhuyr]# docker exec -it bffbf4c92979 netstat -tln
+    Active Internet connections (only servers)
+    Proto Recv-Q Send-Q Local Address           Foreign Address         State       
+    tcp        0      0 127.0.0.1:4001          0.0.0.0:*               LISTEN      
+    tcp        0      0 127.0.0.1:2379          0.0.0.0:*               LISTEN      
+    tcp        0      0 127.0.0.1:2380          0.0.0.0:*               LISTEN      
+    tcp        0      0 127.0.0.1:7001          0.0.0.0:*               LISTEN      
+    tcp        0      0 :::8080                 :::*                    LISTEN      
+    tcp        0      0 :::8081                 :::*                    LISTEN      
+    tcp        0      0 :::53                   :::*                    LISTEN      
+    [root@k8smaster zhuyr]# docker exec -it dfded0b848f1 netstat -tln
+    Active Internet connections (only servers)
+    Proto Recv-Q Send-Q Local Address           Foreign Address         State       
+    tcp        0      0 127.0.0.1:4001          0.0.0.0:*               LISTEN      
+    tcp        0      0 127.0.0.1:2379          0.0.0.0:*               LISTEN      
+    tcp        0      0 127.0.0.1:2380          0.0.0.0:*               LISTEN      
+    tcp        0      0 127.0.0.1:7001          0.0.0.0:*               LISTEN      
+    tcp        0      0 :::8080                 :::*                    LISTEN      
+    tcp        0      0 :::8081                 :::*                    LISTEN      
+    tcp        0      0 :::53                   :::*                    LISTEN      
+    [root@k8smaster zhuyr]# docker exec -it b8b0eaef5c9e netstat -tln
+    rpc error: code = 2 desc = oci runtime error: exec failed: container_linux.go:247: starting container process caused "exec: \"netstat\": executable file not found in $PATH"
+    
+    [root@k8smaster zhuyr]# 
+    
+##查看LOGS
+    
+   
+
+    [root@k8smaster zhuyr]# kubectl get pods -o wide --all-namespaces 
+    NAMESPACE     NAME                 READY     STATUS        RESTARTS   AGE       IP          NODE
+    kube-system   kube-dns-v11-lf68f   4/4       Running       0          1h        10.1.75.2   k8smaster
+    [root@k8smaster zhuyr]# kubectl logs kube-dns-v11-lf68f skydns --namespace=kube-system
+    2017/03/10 01:45:36 skydns: falling back to default configuration, could not read from etcd: 100: Key not found (/skydns) [1]
+    2017/03/10 01:45:36 skydns: ready for queries on cluster.local. for tcp://0.0.0.0:53 [rcache 0]
+    2017/03/10 01:45:36 skydns: ready for queries on cluster.local. for udp://0.0.0.0:53 [rcache 0]
+    [root@k8smaster zhuyr]# kubectl logs kube-dns-v11-lf68f kube2sky --namespace=kube-system
+    I0310 01:45:36.478024       1 kube2sky.go:485] Etcd server found: http://127.0.0.1:4001
+    I0310 01:45:37.479122       1 kube2sky.go:552] Using http://172.16.160.205:8080 for kubernetes master
+    I0310 01:45:37.479135       1 kube2sky.go:553] Using kubernetes API v1
+    I0310 01:45:37.479211       1 kube2sky.go:621] Waiting for service: default/kubernetes
+    I0310 01:45:37.481860       1 kube2sky.go:683] Successfully added DNS record for Kubernetes service.
+    [root@k8smaster zhuyr]# kubectl logs kube-dns-v11-lf68f etcd --namespace=kube-system
+    2017-03-10 01:45:36.084753 I | etcdmain: etcd Version: 2.2.1
+    2017-03-10 01:45:36.084800 I | etcdmain: Git SHA: 75f8282
+    2017-03-10 01:45:36.084808 I | etcdmain: Go Version: go1.5.1
+    2017-03-10 01:45:36.084812 I | etcdmain: Go OS/Arch: linux/amd64
+    2017-03-10 01:45:36.084816 I | etcdmain: setting maximum number of CPUs to 4, total number of available CPUs is 4
+    2017-03-10 01:45:36.085016 I | etcdmain: listening for peers on http://localhost:2380
+    2017-03-10 01:45:36.085073 I | etcdmain: listening for peers on http://localhost:7001
+    2017-03-10 01:45:36.085115 I | etcdmain: listening for client requests on http://127.0.0.1:2379
+    2017-03-10 01:45:36.085136 I | etcdmain: listening for client requests on http://127.0.0.1:4001
+    2017-03-10 01:45:36.085268 I | etcdserver: name = default
+    2017-03-10 01:45:36.085282 I | etcdserver: data dir = /tmp/data
+    2017-03-10 01:45:36.085286 I | etcdserver: member dir = /tmp/data/member
+    2017-03-10 01:45:36.085291 I | etcdserver: heartbeat = 100ms
+    2017-03-10 01:45:36.085294 I | etcdserver: election = 1000ms
+    2017-03-10 01:45:36.085297 I | etcdserver: snapshot count = 10000
+    2017-03-10 01:45:36.085305 I | etcdserver: advertise client URLs = http://127.0.0.1:2379,http://127.0.0.1:4001
+    2017-03-10 01:45:36.085312 I | etcdserver: initial advertise peer URLs = http://localhost:2380,http://localhost:7001
+    2017-03-10 01:45:36.085346 I | etcdserver: initial cluster = default=http://localhost:2380,default=http://localhost:7001
+    2017-03-10 01:45:36.106367 I | etcdserver: starting member 6a5871dbdd12c17c in cluster f68652439e3f8f2a
+    2017-03-10 01:45:36.106413 I | raft: 6a5871dbdd12c17c became follower at term 0
+    2017-03-10 01:45:36.106431 I | raft: newRaft 6a5871dbdd12c17c [peers: [], term: 0, commit: 0, applied: 0, lastindex: 0, lastterm: 0]
+    2017-03-10 01:45:36.106438 I | raft: 6a5871dbdd12c17c became follower at term 1
+    2017-03-10 01:45:36.106531 I | etcdserver: starting server... [version: 2.2.1, cluster version: to_be_decided]
+    2017-03-10 01:45:36.107112 N | etcdserver: added local member 6a5871dbdd12c17c [http://localhost:2380 http://localhost:7001] to cluster f68652439e3f8f2a
+    2017-03-10 01:45:36.906658 I | raft: 6a5871dbdd12c17c is starting a new election at term 1
+    2017-03-10 01:45:36.906687 I | raft: 6a5871dbdd12c17c became candidate at term 2
+    2017-03-10 01:45:36.906694 I | raft: 6a5871dbdd12c17c received vote from 6a5871dbdd12c17c at term 2
+    2017-03-10 01:45:36.906713 I | raft: 6a5871dbdd12c17c became leader at term 2
+    2017-03-10 01:45:36.906725 I | raft: raft.node: 6a5871dbdd12c17c elected leader 6a5871dbdd12c17c at term 2
+    2017-03-10 01:45:36.906947 I | etcdserver: setting up the initial cluster version to 2.2
+    2017-03-10 01:45:36.917583 N | etcdserver: set the initial cluster version to 2.2
+    2017-03-10 01:45:36.917648 I | etcdserver: published {Name:default ClientURLs:[http://127.0.0.1:2379 http://127.0.0.1:4001]} to cluster f68652439e3f8f2a
+    [root@k8smaster zhuyr]#  
+    
+    
+    
+    
+    
+    
