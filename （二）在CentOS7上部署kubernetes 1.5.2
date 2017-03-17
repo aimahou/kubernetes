@@ -1,0 +1,212 @@
+#1.6 配置flannel网络
+Flannel的设计目的就是为集群中的所有节点重新规划IP地址的使用规则，
+从而使得不同节点上的容器能够获得“同属一个内网”且”不重复的”IP地址，
+并让属于不同节点上的容器能够直接通过内网IP通信。
+同属一个内网10.1.0.0/16
+”不重复的”
+flannel.1网段： 10.1.44.0/16
+docker0网段：   10.1.44.1/24
+mysql1镜像：    10.1.44.2/24
+
+flannel.1网段： 10.1.87.0/16
+docker0网段：   10.1.87.1/24 
+mysql2镜像：    10.1.87.2/24
+
+    [root@k8snode ~]# yum -y install flannel
+    
+    [root@k8snode ~]# mv /etc/sysconfig/flanneld /etc/sysconfig/flanneld.bak
+    [root@k8snode ~]# vi /etc/sysconfig/flanneld
+    FLANNEL_ETCD_ENDPOINTS="http://172.16.160.205:2379"
+    FLANNEL_ETCD_PREFIX="/flannel/network"
+    FLANNEL_OPTIONS="-iface=eno16777984"
+
+注：上面eno16777984是宿主机的物理网卡名称
+设置fannel网络段，写入ETCD集群数据库中，如果ETCD是旧版的端口为4012
+只要写入一次就行了。
+
+curl -L http://172.16.160.205:2379/v2/keys/flannel/network/config -XPUT -d value="{\"Network\":\"10.1.0.0/16\",\"SubnetLen\":24,\"Backend\":{\"Type\":\"vxlan\",\"VNI\":1}}"
+
+    [root@k8snode1 ~]# curl -L http://172.16.160.205:2379/v2/keys/flannel/network/config -XPUT -d value="{\"Network\":\"10.1.0.0/16\",\"SubnetLen\":24,\"Backend\":{\"Type\":\"vxlan\",\"VNI\":1}}"
+    {"action":"set","node":{"key":"/flannel/network/config","value":"{\"Network\":\"10.1.0.0/16\",\"SubnetLen\":24,\"Backend\":{\"Type\":\"vxlan\",\"VNI\":1}}","modifiedIndex":82280,"createdIndex":82280}}
+    [root@k8snode1 ~]# 
+查看写入etcd的数据
+
+    [root@k8snode1 ~]# etcdctl get /flannel/network/config 
+    {"Network":"10.1.0.0/16","SubnetLen":24,"Backend":{"Type":"vxlan","VNI":1}}
+    [root@k8snode1 ~]# 
+
+或者使用以下方法写入ETCD中
+在当前目录下创建一个config.json，内容如下：
+
+    {
+    "Network": "10.1.0.0/16",
+    "SubnetLen": 24,
+    "Backend": {
+         "Type": "vxlan",
+         "VNI": 7890
+         }
+     }
+    
+写入数据库
+
+    $ curl -L http://172.16.160.205:2379/v2/keys/flannel/network/config -XPUT --data-urlencode value@config.json
+
+写入ETCD中的key为 /flannel/network/config ，后面配置flannel服务时需要用到。
+配置项中的 Network 为整个k8s集群可用的子网段；
+SubnetLen为每个Node结点的子网掩码长度；
+Type表示封包的方式，推荐使用vxlan，此外还有udp等方式。
+
+
+或者使用以下方法写入ETCD中
+
+    [root@k8snode1 ~]# etcdctl set /k8s/network/config '{ "Network": "10.1.0.0/16" }'
+    { "Network": "10.1.0.0/16" }
+
+flannel配置文件一般不用再修改了。
+注意：
+/etc/sysconfig/flanneld文件里指定了FLANNEL_OPTIONS值为"-iface=eno16777984"表示使用物理网卡　
+
+    [root@k8snode1 ~]# cat /usr/lib/systemd/system/flanneld.service
+    [Unit]
+    Description=Flanneld overlay address etcd agent
+    After=network.target
+    After=network-online.target
+    Wants=network-online.target
+    After=etcd.service
+    Before=docker.service
+    
+    [Service]
+    Type=notify
+    EnvironmentFile=/etc/sysconfig/flanneld
+    EnvironmentFile=-/etc/sysconfig/docker-network
+    ExecStart=/usr/bin/flanneld-start $FLANNEL_OPTIONS
+    ExecStartPost=/usr/libexec/flannel/mk-docker-opts.sh -k DOCKER_NETWORK_OPTIONS -d /run/flannel/docker
+    Restart=on-failure
+    
+    [Install]
+    WantedBy=multi-user.target
+    RequiredBy=docker.service
+    [root@k8snode1 ~]# 
+
+最后让docker启动时使用flannel网络，修改
+ExecStart=/usr/bin/dockerd为ExecStart=/usr/bin/dockerd $DOCKER_NETWORK_OPTIONS
+
+    [root@k8snode ~]# vi /usr/lib/systemd/system/docker.service
+    [Unit]
+    Description=Docker Application Container Engine
+    Documentation=https://docs.docker.com
+    After=network.target firewalld.service
+    
+    [Service]
+    Type=notify
+    # the default is not to use systemd for cgroups because the delegate issues still
+    # exists and systemd currently does not support the cgroup feature set required
+    # for containers run by docker
+    ExecStart=/usr/bin/dockerd $DOCKER_NETWORK_OPTIONS
+    ExecReload=/bin/kill -s HUP $MAINPID
+    # Having non-zero Limit*s causes performance problems due to accounting overhead
+    # in the kernel. We recommend using cgroups to do container-local accounting.
+    LimitNOFILE=infinity
+    LimitNPROC=infinity
+    LimitCORE=infinity
+    # Uncomment TasksMax if your systemd version supports it.
+    # Only systemd 226 and above support this version.
+    #TasksMax=infinity
+    TimeoutStartSec=0
+    # set delegate yes so that systemd does not reset the cgroups of docker containers
+    Delegate=yes
+    # kill only the docker process, not all processes in the cgroup
+    KillMode=process
+    
+    [Install]
+    WantedBy=multi-user.target
+    [root@k8snode1 ~]# 
+    
+    [root@k8snode ~]# systemctl daemon-reload
+    [root@k8snode ~]# systemctl enable flanneld.service
+    [root@k8snode ~]# systemctl start flanneld.service
+    [root@k8snode ~]# systemctl stop docker.service
+    [root@k8snode ~]# systemctl start docker.service
+
+如果有问题，可以使用命令ip link del dev docker0删除虚拟网卡docker0或删除flannel0
+
+    [root@k8snode1 ~]# ip route
+    default via 172.16.160.1 dev eno16777984  proto static  metric 100 
+    10.1.0.0/16 dev flannel.1  proto kernel  scope link  src 10.1.44.0 
+    10.1.44.0/24 dev docker0  proto kernel  scope link  src 10.1.44.1 
+    172.16.160.0/24 dev eno16777984  proto kernel  scope link  src 172.16.160.206  metric 100 
+    [root@k8snode2 ~]# ip route
+    default via 172.16.160.1 dev eno16777984  proto static  metric 100 
+    10.1.0.0/16 dev flannel.1 
+    10.1.87.0/24 dev docker0  proto kernel  scope link  src 10.1.87.1 
+    172.16.160.0/24 dev eno16777984  proto kernel  scope link  src 172.16.160.207  metric 100 
+    [root@k8snode2 ~]# 
+    
+    [root@k8snode1 pod]# ip ad
+    1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN qlen 1
+        link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+        inet 127.0.0.1/8 scope host lo
+           valid_lft forever preferred_lft forever
+        inet6 ::1/128 scope host 
+           valid_lft forever preferred_lft forever
+    2: eno16777984: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP qlen 1000
+        link/ether 00:50:56:b1:07:1c brd ff:ff:ff:ff:ff:ff
+        inet 172.16.160.206/24 brd 172.16.160.255 scope global eno16777984
+           valid_lft forever preferred_lft forever
+        inet6 fe80::250:56ff:feb1:71c/64 scope link 
+           valid_lft forever preferred_lft forever
+    3: flannel.1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UNKNOWN 
+        link/ether 8e:2c:61:b1:cd:b5 brd ff:ff:ff:ff:ff:ff
+        inet 10.1.44.0/16 scope global flannel.1
+           valid_lft forever preferred_lft forever
+    4: docker0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UP 
+        link/ether 02:42:12:e2:45:77 brd ff:ff:ff:ff:ff:ff
+        inet 10.1.44.1/24 scope global docker0
+           valid_lft forever preferred_lft forever
+        inet6 fe80::42:12ff:fee2:4577/64 scope link 
+           valid_lft forever preferred_lft forever
+    6: vethd065e5f@if5: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master docker0 state UP 
+        link/ether 6e:cb:84:21:78:74 brd ff:ff:ff:ff:ff:ff link-netnsid 0
+        inet6 fe80::6ccb:84ff:fe21:7874/64 scope link 
+           valid_lft forever preferred_lft forever
+    [root@k8snode1 pod]# 
+    [root@k8snode2 images]# ip ad
+    1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN qlen 1
+        link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+        inet 127.0.0.1/8 scope host lo
+           valid_lft forever preferred_lft forever
+        inet6 ::1/128 scope host 
+           valid_lft forever preferred_lft forever
+    2: eno16777984: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP qlen 1000
+        link/ether 00:50:56:b1:97:fc brd ff:ff:ff:ff:ff:ff
+        inet 172.16.160.207/24 brd 172.16.160.255 scope global eno16777984
+           valid_lft forever preferred_lft forever
+        inet6 fe80::250:56ff:feb1:97fc/64 scope link 
+           valid_lft forever preferred_lft forever
+    3: docker0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UP 
+        link/ether 02:42:df:75:e3:e9 brd ff:ff:ff:ff:ff:ff
+        inet 10.1.87.1/24 scope global docker0
+           valid_lft forever preferred_lft forever
+        inet6 fe80::42:dfff:fe75:e3e9/64 scope link 
+           valid_lft forever preferred_lft forever
+    4: flannel.1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UNKNOWN 
+        link/ether 1e:71:74:50:e1:8f brd ff:ff:ff:ff:ff:ff
+        inet 10.1.87.0/16 scope global flannel.1
+           valid_lft forever preferred_lft forever
+    6: veth96b171b@if5: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master docker0 state UP 
+        link/ether ea:44:63:15:9b:4f brd ff:ff:ff:ff:ff:ff link-netnsid 0
+        inet6 fe80::e844:63ff:fe15:9b4f/64 scope link 
+           valid_lft forever preferred_lft forever
+    [root@k8snode2 images]# 
+
+在三台虚拟机上的docker上跑nginx，然后测试能否互相访问80端口的资源
+
+    docker run -d -p 8088:80 --name mynginx greatbsky/nginx 
+    
+    docker exec -it mynginx /bin/bash
+    
+    ifconfig
+    
+    curl 10.1.75.2:80
+
+三台容器之间可以互相访问80端口资源
