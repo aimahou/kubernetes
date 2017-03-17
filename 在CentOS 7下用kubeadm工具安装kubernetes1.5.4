@@ -1,0 +1,198 @@
+
+#一、环境准备
+
+首先环境还是三台虚拟机，虚拟机地址如下
+
+IP 地址	节点
+
+    172.16.160.211   master.k8s
+    172.16.160.212   node1.k8s
+    172.16.160.213   node2.k8s
+
+节点主机名最好为 xxx.xxx 这种域名格式，否则在某些情况下，POD 中跑的程序使用域名解析时可能出现问题，所以先要处理一下主机名
+三台虚拟的hosts文件如下：
+
+    [root@master etc]# vi /etc/hosts
+    127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+    ::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+    
+    172.16.160.211   master.k8s
+    172.16.160.212   node1.k8s
+    172.16.160.213   node2.k8s
+    127.0.0.1        master.k8s
+    
+    61.91.161.217 google.com
+    61.91.161.217 www.gcr.io
+    61.91.161.217 console.cloud.google.com
+    61.91.161.217 storage.googleapis.com
+    61.91.161.217 gcr.io
+    
+    [root@master etc]# 
+注：另外再自己配置下阿里云加速器
+
+#二、安装docker
+然后每台机器安装好 docker，至于 rpm 安装包版本下面介绍
+
+    [root@master etc]# cat /etc/yum.repos.d/docker.repo
+    [dockerrepo]
+    name=Docker Repository
+    baseurl=https://yum.dockerproject.org/repo/main/centos/$releasever/
+    enabled=1
+    gpgcheck=1
+    gpgkey=https://yum.dockerproject.org/gpg
+    [root@master manifests]# 
+
+每台虚拟运行以下命令安装docker
+
+    [root@master etc]# yum install docker-engine-1.12.6*
+
+或使用以下命令下载rpm再传到其它两台虚拟机上安装
+
+    [root@master etc]# yumdownloader docker-engine-1.12.6*
+
+将下载docker-engine-1.12.6-1.el7.centos.x86_64.rpm到本地
+
+安装命令：
+
+    [root@master etc]# rpm -ivh docker-engine-1.12.6-1.el7.centos.x86_64.rpm
+
+版本信息如下：
+
+    [root@master etc]# docker -v
+    Docker version 1.12.6, build 78d1802
+    [root@master etc]#
+
+#三、安装kubeadm工具等
+
+Kubernetes 编译的各种发行版安装包来源于 Github 上的叫 release 的项目，
+https://github.com/kubernetes/release，把这个项目 clone 下来，
+由于本人是 Centos 用户，所以进入 rpm 目录，在安装好 docker 的机器上执行那个 docker-build.sh 脚本即可编译 rpm 包，
+最后会生成到当前目录的 output 目录下,截图如下
+安装git工具
+
+    [root@temp x86_64]# yum install -y git
+
+复制代码到本地
+
+    [root@temp x86_64]# git clone https://github.com/kubernetes/release
+    [root@k8smaster rpm]# pwd
+    /home/git/release/rpm
+    [root@k8smaster rpm]# 
+    [root@k8smaster rpm]# ./docker-build.sh 
+
+即可生成rpm包和repodate（没用）
+
+    [root@temp x86_64]# pwd
+    /home/git/release/rpm/output/x86_64
+    [root@temp x86_64]# ll
+    总用量 35212
+    -rw-r--r--. 1 root root  6121630 3月  14 11:27 kubeadm-1.6.0-0.alpha.0.2074.a092d8e0f95f52.x86_64.rpm
+    -rw-r--r--. 1 root root  6918342 3月  14 11:27 kubectl-1.5.1-0.x86_64.rpm
+    -rw-r--r--. 1 root root 12722026 3月  14 11:27 kubelet-1.5.1-0.x86_64.rpm
+    -rw-r--r--. 1 root root 10283750 3月  14 11:27 kubernetes-cni-0.3.0.1-0.07a8a2.x86_64.rpm
+    drwxr-xr-x. 2 root root     4096 3月  14 11:27 repodata
+    [root@k8smaster x86_64]# 
+
+将以上四个rpm包scp到要安装k8s的虚拟机上，全部安装。
+
+#四、初始化环境
+kubeadm 等相关 rpm 安装后会生成 /etc/kubernetes 目录，而 kubeadm init 时候又会检测这些目录是否存在，如果存在则停止初始化，所以要先清理一下，以下清理脚本来源于 官方文档 Tear down 部分，该脚本同样适用于初始化失败进行重置
+
+    [root@master etc]# systemctl stop kubelet;
+
+注意: 下面这条命令会干掉所有正在运行的 docker 容器，
+如果要进行重置操作，最好先确定当前运行的所有容器都能干掉(干掉不影响业务)，
+否则的话最好手动删除 kubeadm 创建的相关容器(gcr.io 相关的)
+
+    [root@master etc]# docker rm -f -v $(docker ps -q);
+    [root@master etc]# find /var/lib/kubelet | xargs -n 1 findmnt -n -t tmpfs -o TARGET -T | uniq | xargs -r umount -v;
+    rm -r -f /etc/kubernetes /var/lib/kubelet /var/lib/etcd;
+
+还有个坑，初始化以前记得一定要启动 kubelet，虽然你 systemctl status kubelet 看着他是启动失败，但是也得启动，否则绝壁卡死
+
+    [root@master etc]# systemctl enable kubelet
+    [root@master etc]# systemctl start kubelet
+
+三台虚拟机也要都把docker设置为enable否则会报错：
+
+    [root@master etc]# systemctl enable docker
+    [root@master etc]# systemctl start docker
+
+等会等会，还有坑，新版本直接kubeadm init 会提示 ebtables not found in system path 错误，所以还得先安装一下这个包在初始化
+
+安装 ebtables
+
+    [root@master etc]# yum install -y ebtables
+
+#五、开始安装kubernetes
+
+    [root@master etc]# kubeadm init --api-advertise-addresses=172.16.160.211
+
+这里再爆料一个坑，
+底下的 kubeadm join --token=598a48.a54e9ce122157edb 172.16.160.211 这条命令一定保存好，
+因为后期没法重现的，你们老大再让你添加机器的时候如果没这个你会哭的；
+进入 /etc/kubernetes/manifests 可以看到许多 json 文件，这些文件中定义了需要哪些基础镜像
+
+    [root@master yaml_dashboard]# docker images
+    REPOSITORY                                               TAG                 IMAGE ID            CREATED             SIZE
+    gcr.io/google_containers/kube-controller-manager-amd64   v1.5.4              28923e01f302        6 days ago          102.8 MB
+    gcr.io/google_containers/kube-apiserver-amd64            v1.5.4              b951e253e3cd        6 days ago          125.9 MB
+    gcr.io/google_containers/kube-scheduler-amd64            v1.5.4              e0956b5550fd        6 days ago          54 MB
+    gcr.io/google_containers/kube-proxy-amd64                v1.5.4              d118470263f4        6 days ago          173.5 MB
+    gcr.io/google_containers/etcd-amd64                      3.0.14-kubeadm      856e39ac7be3        3 months ago        174.9 MB
+    gcr.io/google_containers/kubedns-amd64                   1.9                 26cf1ed9b144        3 months ago        47 MB
+    gcr.io/google_containers/dnsmasq-metrics-amd64           1.0                 5271aabced07        4 months ago        14 MB
+    gcr.io/google_containers/kube-dnsmasq-amd64              1.4                 3ec65756a89b        5 months ago        5.126 MB
+    gcr.io/google_containers/kube-discovery-amd64            1.0                 c5e0c9a457fc        5 months ago        134.2 MB
+    gcr.io/google_containers/exechealthz-amd64               1.2                 93a43bfb39bf        5 months ago        8.375 MB
+    gcr.io/google_containers/pause-amd64                     3.0                 99e59f495ffa        10 months ago       746.9 kB
+    weaveworks/weave-npc                                     1.9.3               1d43a52978ce        6 days ago          58.23 MB
+    weaveworks/weave-kube                                    1.9.3               24cb786c2680        6 days ago          163.2 MB
+    [root@master yaml_dashboard]# 
+
+#六、加入node
+
+    [root@master etc]# kubeadm join --token=598a48.a54e9ce122157edb 172.16.160.211
+
+
+#七、部署 weave 网络
+
+再没部署 weave 时，dns 是启动不了的kube-dns-2924299975-nmzt0 状态处于ContainerCreating
+官方给出的命令是这样的
+
+    [root@master etc]# kubectl create -f https://git.io/weave-kube
+
+本着 “刨根问底挖祖坟” 的精神，先把这个 yaml 搞下来
+
+    [root@master etc]# wget https://git.io/weave-kube -O weave-kube.yaml
+    [root@master etc]# kubectl create -f weave-kube.yaml
+
+
+#八、部署 dashboard
+dashboard 的命令也跟 weave 的一样，
+
+    [root@master etc]# wget https://rawgit.com/kubernetes/dashboard/master/src/deploy/kubernetes-dashboard.yaml -O kubernetes-dashboard.yaml
+    [root@master etc]# kubectl create -f kubernetes-dashboard.yaml
+
+如果镜像拉取有问题：默认的 yaml 文件中对于 image 拉取策略的定义是无论何时都会去拉取镜像，导致即使你 load 进去也无卵用，所以还得先把 yaml 搞下来然后改一下镜像拉取策略，最后再 create -f 即可　编辑 yaml 改一下 imagePullPolicy，把 Always 改成 IfNotPresent(本地没有再去拉取) 或者 Never(从不去拉取) 即可
+
+通过 describe 命令我们可以查看其暴露出的 NodePoint,然后便可访问
+
+    [root@master etc]# kubectl describe svc kubernetes-dashboard --namespace=kube-system
+    Name:                   kubernetes-dashboard
+    Namespace:              kube-system
+    Labels:                 app=kubernetes-dashboard
+    Selector:               app=kubernetes-dashboard
+    Type:                   NodePort
+    IP:                     10.107.208.61
+    Port:                   <unset> 80/TCP
+    NodePort:               <unset> 32284/TCP
+    Endpoints:              10.46.0.1:9090
+    Session Affinity:       None
+    No events.
+    [root@master etc]# 
+
+打开浏览器，访问：（kubernetes的api-server地址）
+
+    http://172.16.160.211:32284/#/deployment?namespace=kube-system
+
