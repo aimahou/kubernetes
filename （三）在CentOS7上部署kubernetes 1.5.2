@@ -1,0 +1,170 @@
+#1.7部署Kube-dns插件
+Kubernetes DNS 有三个组件组成：etcd，kube2sky，skyDNS
+##所有的yaml文件
+    [root@k8smaster pod]# ll
+    总用量 64
+    -rw-r--r--  1 root root 1567 3月   6 08:52 skydns-controller.yaml
+    -rw-r--r--  1 root root  330 3月   6 08:52 skydns-service.yaml
+    -rw-r--r--  1 root root  427 3月   6 09:37 frontend-controller.yaml
+    -rw-r--r--. 1 root root  181 2月  28 16:27 frontend-service.yaml
+    -rw-r--r--. 1 root root  311 3月   1 14:13 nginx-deployment.yaml
+    -rw-r--r--  1 root root  368 3月   6 09:36 redis-master-controller.yaml
+    -rw-r--r--. 1 root root  179 2月  28 16:25 redis-master-service.yaml
+    -rw-r--r--. 1 root root  439 2月  28 16:26 redis-slave-controller.yaml
+    -rw-r--r--. 1 root root  176 2月  28 16:26 redis-slave-service.yaml
+    [root@k8snode pod]# 
+##在所有节点上下载所需的镜像
+    [root@k8snode pod]# docker pull index.tenxcloud.com/google_containers/etcd:2.2.5
+    [root@k8snode pod]# docker pull index.tenxcloud.com/google_containers/kube2sky:1.15
+    [root@k8snode pod]# docker pull index.tenxcloud.com/google_containers/skydns:2015-10-13-8c72f8c
+    [root@k8snode pod]# docker pull gcr.io/google_containers/pause-amd64:3.0
+
+##yaml文件内容
+
+    [root@k8smaster pod]# cat skydns-controller.yaml
+    apiVersion: v1
+    kind: ReplicationController
+    metadata:
+      name: dns-rc-test
+      labels:
+        k8s-app: dns
+        version: v8
+        kubernetes.io/cluster-service: "true"
+    spec:
+      replicas: 1
+      selector:
+        k8s-app: dns
+        version: v8
+        kubernetes.io/cluster-service: "true"
+      template:
+        metadata:
+          labels:
+            k8s-app: dns
+            version: v8
+            kubernetes.io/cluster-service: "true"
+        spec:
+          containers:
+          - name: etcd
+            image: index.tenxcloud.com/google_containers/etcd:2.2.5
+            command:
+            - /usr/local/bin/etcd
+            - -data-dir
+            - /var/etcd/data
+            - -listen-client-urls
+            - http://127.0.0.1:2379,http://127.0.0.1:4001
+            - -advertise-client-urls
+            - http://127.0.0.1:2379,http://127.0.0.1:4001
+            - -initial-cluster-token
+            - skydns-etcd
+            volumeMounts:
+            - name : etcd-storage
+              mountPath: /var/etcd/data
+          - name: kube2sky 
+            image: index.tenxcloud.com/google_containers/kube2sky:1.15
+            args:
+            - --kube-master_url=http://172.16.160.205:8080   #此处要修改成自己的api-server
+            - --domain=mycluster.com
+          - name: skydns
+            image: index.tenxcloud.com/google_containers/skydns:2015-10-13-8c72f8c
+            args:
+            - -machines=http://127.0.0.1:4001
+            - -addr=0.0.0.0:53
+            - -domain=test.com    #此处要修改成自己想要的域名
+            ports:
+            - containerPort: 53
+              name: dns-udp
+              protocol: UDP
+            - containerPort: 53
+              name: dns-tcp
+              protocol: TCP
+          volumes:
+          - name: etcd-storage
+            emptyDir: {}
+          dnsPolicy: Default
+    [root@k8smaster pod]# 
+    [root@k8smaster pod]# cat skydns-service.yaml
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: dns-svc-test
+      labels:
+        k8s-app: dns
+        kubernetes.io/cluster-service: "true"
+        kubernetes.io/name: "DNStest"
+    spec:
+      selector:
+        k8s-app: dns
+      clusterIP: 172.20.40.1　　　#在service-cluster-ip-range范围取一个值　kubectl get svc查看
+      ports:
+      - name: dns-udp
+        port: 53
+        protocol: UDP
+      - name: dns-tcp
+        port: 53
+        protocol: TCP
+    [root@k8smaster pod]# 
+
+##修改node上kubelet配置参数
+在kubelet配置文件中添加以下两条
+KUBELET_CLUSTER_DNS="--cluster_dns=172.20.40.1"
+KUBELET_CLUSTER_DOMAIN="--cluster_domain=test.com"
+
+    [root@k8smaster pod]# cat /etc/kubernetes/kubelet 
+    #KUBELET_ADDRESS="--address=127.0.0.1"
+    KUBELET_ADDRESS="--address=0.0.0.0"
+    # KUBELET_PORT="--port=10250"
+    #KUBELET_HOSTNAME="--hostname-override=127.0.0.1"
+    KUBELET_HOSTNAME="--hostname-override=k8smaster" 
+    #KUBELET_API_SERVER="--api-servers=http://127.0.0.1:8080"
+    KUBELET_API_SERVER="--api-servers=http://172.16.160.205:8080"
+    
+    KUBELET_CLUSTER_DNS="--cluster_dns=172.20.40.1"
+    KUBELET_CLUSTER_DOMAIN="--cluster_domain=test.com"
+    
+    KUBELET_POD_INFRA_CONTAINER="--pod-infra-container-image=registry.access.redhat.com/rhel7/pod-infrastructure:latest"
+    KUBELET_ARGS=""
+    [root@k8smaster pod]#
+
+ 
+##部署前查看service里内容
+
+    [root@k8smaster pod]# kubectl get svc
+    NAME         CLUSTER-IP   EXTERNAL-IP   PORT(S)   AGE
+    kubernetes   172.20.0.1   <none>        443/TCP   2d
+##部署dns
+
+    [root@k8smaster pod]# 
+    [root@k8smaster pod]# kubectl create -f skydns-controller.yaml 
+    replicationcontroller "dns-rc-test" created
+    [root@k8smaster pod]# kubectl create -f skydns-service.yaml 
+    service "dns-svc-test" created
+##部署后查看
+    [root@k8smaster pod]# kubectl get svc --all-namespaces 
+    NAMESPACE   NAME           CLUSTER-IP    EXTERNAL-IP   PORT(S)         AGE
+    default     dns-svc-test   172.20.40.1   <none>        53/UDP,53/TCP   8m
+    default     kubernetes     172.20.0.1    <none>        443/TCP         2d
+    [root@k8smaster pod]# 
+    [root@k8smaster pod]# 
+    [root@k8smaster pod]# kubectl get rc -o wide
+    NAME          DESIRED   CURRENT   READY     AGE       CONTAINER(S)           IMAGE(S)                                                                                                                                                               SELECTOR
+    dns-rc-test   1         1         1         21s       etcd,kube2sky,skydns   index.tenxcloud.com/google_containers/etcd:2.2.5,index.tenxcloud.com/google_containers/kube2sky:1.15,index.tenxcloud.com/google_containers/skydns:2015-10-13-8c72f8c   k8s-app=dns,kubernetes.io/cluster-service=true,version=v8
+    [root@k8smaster pod]# kubectl get pods -o wide --all-namespaces 
+    NAMESPACE   NAME                READY     STATUS    RESTARTS   AGE       IP          NODE
+    default     dns-rc-test-rgmwx   3/3       Running   0          7m        10.1.75.3   k8snode1
+    [root@k8smaster pod]# 
+    [root@k8smaster pod]# 
+    [root@k8snode1 pod]# docker ps -a
+    CONTAINER ID        IMAGE                                                             COMMAND                  CREATED              STATUS              PORTS                           NAMES
+    f053249d8d1c        index.tenxcloud.com/google_containers/skydns:2015-10-13-8c72f8c   "/skydns -machines..."   About a minute ago   Up About a minute                                   k8s_skydns.86c34e0e_dns-rc-test-rgmwx_default_70b62242-0213-11e7-b445-005056b1ced4_967692b2
+    a679b6593c01        index.tenxcloud.com/google_containers/kube2sky:1.15               "/kube2sky --kube-..."   About a minute ago   Up About a minute                                   k8s_kube2sky.37150485_dns-rc-test-rgmwx_default_70b62242-0213-11e7-b445-005056b1ced4_fe549abe
+    34dc62434730        index.tenxcloud.com/google_containers/etcd:2.2.5                  "/usr/local/bin/et..."   About a minute ago   Up About a minute                                   k8s_etcd.4dd50e0_dns-rc-test-rgmwx_default_70b62242-0213-11e7-b445-005056b1ced4_efb16589
+    3dab9faae643        gcr.io/google_containers/pause-amd64:3.0                          "/pause"                 About a minute ago   Up About a minute                                   k8s_POD.6bb72b22_dns-rc-test-rgmwx_default_70b62242-0213-11e7-b445-005056b1ced4_1a3fecde
+    [root@k8smaster pod]# 
+
+到目前为此，kubernetes DNS已经部署完成，测试方法另外讲
+##反部署DNS
+
+    [root@k8smaster pod]# kubectl delete -f skydns-controller.yaml 
+        
+    [root@k8smaster pod]# kubectl delete -f skydns-service.yaml 
+
