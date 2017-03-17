@@ -1,0 +1,88 @@
+#1、部署jenkins
+##1.1、deployment
+
+    [root@master yaml_jenkins]# cat jenkins-deployment.yaml 
+    apiVersion: extensions/v1beta1  
+    kind: Deployment  
+    metadata:  
+      name: jenkins  
+    spec:  
+      replicas: 1  
+      strategy:  
+        type: RollingUpdate  
+        rollingUpdate:  
+          maxSurge: 2  
+          maxUnavailable: 0  
+      template:  
+        metadata:  
+          labels:  
+            app: jenkins  
+        spec:  
+          containers:  
+          - name: jenkins  
+            image: jenkins:latest  
+            imagePullPolicy: IfNotPresent  
+            ports:  
+            - containerPort: 8080  
+              name: web  
+              protocol: TCP  
+            - containerPort: 50000  
+              name: agent  
+              protocol: TCP  
+            volumeMounts:  
+            - name: jenkinshome  
+              mountPath: /var/jenkins_home 
+            env:  
+            - name: JAVA_OPTS  
+              value: "-Duser.timezone=Asia/Shanghai"  
+          volumes:  
+          - name: jenkinshome  
+            nfs:  
+              server: 172.16.160.29  
+              path: "/home/nfs/jenkinshome"  
+    [root@master yaml_jenkins]# 
+
+/var/jenkins_home 挂载到172.16.160.29 的/home/nfs/目录
+172.16.160.29  上需要安装nfs服务器端
+
+
+##1.2、svc
+
+    [root@master yaml_jenkins]# cat jenkins-service.yaml 
+    kind: Service
+    apiVersion: v1
+    metadata:
+      labels:
+          app: jenkins
+      name: jenkins
+    spec:
+      ports:
+      - port: 8080
+        targetPort: 8080
+        name: web
+      - port: 50000
+        targetPort: 50000
+        name: agent
+      selector:
+        app: jenkins
+    [root@master yaml_jenkins]# 
+
+##1.3、ingress
+
+    [root@master yaml_jenkins]# cat jenkins-ingress.yml 
+    apiVersion: extensions/v1beta1
+    kind: Ingress
+    metadata:
+      name: jenkins-ingress
+      namespace: default
+    spec:
+      rules:
+      - host: jenkins.mayocase.com
+        http:
+          paths:
+          - backend:
+              serviceName: jenkins
+              servicePort: 8080
+    
+    
+    [root@master yaml_jenkins]# 
