@@ -1,0 +1,308 @@
+#1、部署ingress
+##1.1、部署默认后端
+我们知道 前端的 Nginx 最终要负载到后端 service 上，那么如果访问不存在的域名咋整？
+官方给出的建议是部署一个 默认后端，对于未知请求全部负载到这个默认后端上；
+这个后端啥也不干，就是返回 404，
+下载地址：https://github.com/kubernetes/ingress/blob/master/examples/deployment/nginx/default-backend.yaml
+
+    [root@master yaml_ingress]# cat default-backend.yaml 
+    apiVersion: extensions/v1beta1
+    kind: Deployment
+    metadata:
+      name: default-http-backend
+      labels:
+        k8s-app: default-http-backend
+      namespace: kube-system
+    spec:
+      replicas: 1
+      template:
+        metadata:
+          labels:
+            k8s-app: default-http-backend
+        spec:
+          terminationGracePeriodSeconds: 60
+          containers:
+          - name: default-http-backend
+            # Any image is permissable as long as:
+            # 1. It serves a 404 page at /
+            # 2. It serves 200 on a /healthz endpoint
+            image: gcr.io/google_containers/defaultbackend:1.0
+            livenessProbe:
+              httpGet:
+                path: /healthz
+                port: 8080
+                scheme: HTTP
+              initialDelaySeconds: 30
+              timeoutSeconds: 5
+            ports:
+            - containerPort: 8080
+            resources:
+              limits:
+                cpu: 10m
+                memory: 20Mi
+              requests:
+                cpu: 10m
+                memory: 20Mi
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: default-http-backend
+      namespace: kube-system
+      labels:
+        k8s-app: default-http-backend
+    spec:
+      ports:
+      - port: 80
+        targetPort: 8080
+      selector:
+        k8s-app: default-http-backend
+    [root@master yaml_ingress]# kubectl apply -f default-backend.yaml
+
+##1.2、部署 Ingress Controller
+部署完了后端就得把最重要的组件 Nginx+Ingres Controller(官方统一称为 Ingress Controller) 部署上
+注意：官方的 Ingress Controller 有个坑:
+没有绑定到宿主机 80 端口，也就是说前端 Nginx 没有监听宿主机 80 端口(这还玩个卵啊)；
+所以需要把配置搞下来自己加一下 hostNetwork: true，或把hostNetwork: true前面的注释取消掉。
+下载地址：https://github.com/kubernetes/ingress/blob/master/examples/daemonset/nginx/nginx-ingress-daemonset.yaml
+
+    [root@master yaml_ingress]# cat nginx-ingress-daemonset.yaml 
+    apiVersion: extensions/v1beta1
+    kind: DaemonSet
+    metadata:
+      name: nginx-ingress-lb
+      labels:
+        name: nginx-ingress-lb
+      namespace: kube-system
+    spec:
+      template:
+        metadata:
+          labels:
+            name: nginx-ingress-lb
+        spec:
+          terminationGracePeriodSeconds: 60
+          hostNetwork: true
+          containers:
+          - image: gcr.io/google_containers/nginx-ingress-controller:0.9.0-beta.3
+            name: nginx-ingress-lb
+            readinessProbe:
+              httpGet:
+                path: /healthz
+                port: 10254
+                scheme: HTTP
+            livenessProbe:
+              httpGet:
+                path: /healthz
+                port: 10254
+                scheme: HTTP
+              initialDelaySeconds: 10
+              timeoutSeconds: 1
+            ports:
+            - containerPort: 80
+              hostPort: 80
+            - containerPort: 443
+              hostPort: 443
+            env:
+              - name: POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              - name: POD_NAMESPACE
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.namespace
+            args:
+            - /nginx-ingress-controller
+            - --default-backend-service=$(POD_NAMESPACE)/default-http-backend
+    [root@master yaml_ingress]# 
+    [root@master yaml_ingress]# kubectl apply -f nginx-ingress-daemonset.yaml 
+    
+    
+    [root@master yaml_ingress]# kubectl get pods -o wide --all-namespaces
+    NAMESPACE     NAME                                    READY     STATUS    RESTARTS   AGE       IP               NODE
+    kube-system   default-http-backend-2657704409-4vblt   1/1       Running   0          1h        10.40.0.1        node2.k8s
+    kube-system   nginx-ingress-lb-1hmw3                  1/1       Running   0          46s       172.16.160.211   master.k8s
+    kube-system   nginx-ingress-lb-4ksp2                  1/1       Running   0          46s       172.16.160.212   node1.k8s
+    kube-system   nginx-ingress-lb-mdbg6                  1/1       Running   0          46s       172.16.160.213   node2.k8s
+    [root@master yaml_ingress]# kubectl -n kube-system get svc -o wide
+    NAME                   CLUSTER-IP      EXTERNAL-IP   PORT(S)         AGE       SELECTOR
+    default-http-backend   10.107.209.32   <none>        80/TCP          16m       k8s-app=default-http-backend
+    [root@master yaml_ingress]# 
+
+
+##1.3、部署 Ingress
+从上面可以知道 Ingress 就是个规则，指定哪个域名转发到哪个 Service，
+所以说首先我们得有个 Service，当然 Service 去哪找这里就不管了；
+这里默认为已经有了一个可用的 Service，以下以 Dashboard 为例
+
+    [root@master yaml_ingress]# cat dashboard-ingress.yml 
+    apiVersion: extensions/v1beta1
+    kind: Ingress
+    metadata:
+      name: dashboard-ingress
+      namespace: kube-system
+    spec:
+      rules:
+      - host: dashboard.mayocase.com
+        http:
+          paths:
+          - backend:
+              serviceName: kubernetes-dashboard
+              servicePort: 80
+    [root@master yaml_ingress]# 
+    [root@master yaml_ingress]# kubectl get ingress --all-namespaces
+    NAMESPACE     NAME                HOSTS                    ADDRESS            PORTS     AGE
+    kube-system   dashboard-ingress   dashboard.mayocase.com   172.16.160.21...   80        10m
+    [root@master yaml_ingress]# 
+
+在局域网中的DNS服务器添加dashboard.mayocase.com到172.16.160.211的解析
+然后即可以在浏览器中访问dashboard.mayocase.com　
+此时跟访问http://dashboard.mayocase.com:32284或http://172.16.160.211:32284是一样的界面出现
+但不能直接访问172.16.160.211
+##1.3、部署nfs共享
+###1.3.1部署nfs服务器
+在172.16.160.29上部署nfs服务器，并将/home/nfs目录设置为共享目录，权限为允许172.16.160.0/24网段访问
+
+    [root@docker ~]# yum -y install nfs-utils rpcbind
+    [root@docker ~]# vi /etc/exports
+    /home/nfs/ 172.16.160.0/24(rw,no_root_squash,no_all_squash,sync,anonuid=501,anongid=501)
+    [root@docker ~]# systemctl enable  rpcbind.service
+    [root@docker ~]# systemctl restart  rpcbind.service
+    [root@docker ~]# systemctl enable nfs-server.service
+    [root@docker ~]# systemctl restart nfs-server.service
+    [root@docker ~]# 
+
+默认查看自己共享的服务，前提是要DNS能解析自己，不然容易报错
+
+    [root@docker ~]# showmount -e
+    Export list for docker.mayocase.com:
+    /home/nfs 172.16.160.0/24
+    [root@docker ~]# exportfs
+    /home/nfs/jenkinshome       172.16.160.0/24
+    [root@docker ~]# 
+
+将服务器端的共享目录权限放开：
+
+    [root@docker ~]# chmod 777 /home/nfs/jenkinshome
+
+###1.3.2nfs客户端配置
+这一步可以了解下就好，此nfs共享目录主要是给容器用的。
+
+    [root@node1 ~]# yum install nfs-utils -y
+    [root@node1 ~]# systemctl enable nfs-server.service 
+    [root@node1 ~]# systemctl start nfs-server.service
+
+挂载共享目录172.16.160.100:/home/nfs到本机的挂载点/tmp/nfs
+
+    [root@node1 tmp]# mount 172.16.160.100:/home/nfs/jenkinshome /tmp/nfs
+
+查看挂载信息
+
+    [root@node1 tmp]# mount |grep nfs
+    sunrpc on /var/lib/nfs/rpc_pipefs type rpc_pipefs (rw,relatime)
+    nfsd on /proc/fs/nfsd type nfsd (rw,relatime)
+    172.16.160.100:/home/nfs/jenkinshome on /tmp/nfs type nfs4 (rw,relatime,vers=4.0,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,port=0,timeo=600,retrans=2,sec=sys,clientaddr=172.16.160.212,local_lock=none,addr=172.16.160.100)
+
+卸载挂载目录/tmp/nfs，可以使用以下两种命令：
+
+    [root@node1 tmp]# umount 172.16.160.100:/home/nfs/jenkinshome /tmp/nfs
+    [root@node1 tmp]# umount /tmp/nfs
+    [root@master yaml_jenkins]# showmount -e 172.16.160.29
+    Export list for 172.16.160.29:
+    /home/nfs/jenkinshome 172.16.160.0/24
+    [root@master yaml_jenkins]# 
+
+#2.部署Ingress TLS(未配置成功)
+
+创建一个含有证书的 secret、在 Ingress 开启证书；
+##2.1、创建ingress-secret
+首先第一步当然要有个证书，由于我这个 Ingress 有两个服务域名，所以证书要支持两个域名；生成证书命令如下：
+生成 CA 自签证书
+
+    [root@master cert]# mkdir cert && cd cert
+    [root@master cert]# openssl genrsa -out ca-key.pem 2048
+    [root@master cert]# openssl req -x509 -new -nodes -key ca-key.pem -days 10000 -out ca.pem -subj "/CN=kube-ca"
+
+编辑 openssl 配置
+
+    [root@master cert]# cp /etc/pki/tls/openssl.cnf .
+
+直接在openssl.cnf文件中找到[req]的# req_extensions = v3_req，然后添加以下内容：
+文件中可能出现两个[ v3_req ]，不用管。
+
+    [root@master cert]# vi openssl.cnf
+    
+    req_extensions = v3_req # The extensions to add to a certificate request
+    [ v3_req ]
+    basicConstraints = CA:FALSE
+    keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+    subjectAltName = @alt_names
+    [alt_names]
+    DNS.1 = dashboard.mayocase.com
+    
+    [root@master cert]# ll
+    总用量 20
+    -rw-r--r--. 1 root root  1679 3月  15 15:13 ca-key.pem
+    -rw-r--r--. 1 root root  1090 3月  15 15:14 ca.pem
+    -rw-r--r--. 1 root root 11168 3月  15 15:15 openssl.cnf
+    [root@master cert]# openssl genrsa -out ingress-key.pem 2048
+    [root@master cert]# openssl req -new -key ingress-key.pem -out ingress.csr -subj "/CN=kube-ingress" -config openssl.cnf
+    [root@master cert]# openssl x509 -req -in ingress.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -out ingress.pem -days 365 -extensions v3_req -extfile openssl.cnf
+    
+    [root@master cert]# ll
+    总用量 36
+    -rw-r--r--. 1 root root  1679 3月  15 14:22 ca-key.pem
+    -rw-r--r--. 1 root root  1090 3月  15 14:23 ca.pem
+    -rw-r--r--. 1 root root    17 3月  15 14:55 ca.srl
+    -rw-r--r--. 1 root root  1029 3月  15 14:55 ingress.csr
+    -rw-r--r--. 1 root root  1679 3月  15 14:26 ingress-key.pem
+    -rw-r--r--. 1 root root  1099 3月  15 14:55 ingress.pem
+    -rw-r--r--. 1 root root 11122 3月  15 14:55 openssl.cnf
+    [root@master cert]# kubectl create secret tls ingress-secret --key ingress-key.pem --cert ingress.pem
+    secret "ingress-secret" created
+    [root@master cert]# 
+
+##2.2、在 Ingress 开启证书
+重新部署 Ingress
+
+    [root@master yaml_ingress]# vi dashboard-ingress-tls.yml
+    
+    apiVersion: extensions/v1beta1
+    kind: Ingress
+    metadata:
+      name: dashboard-ingress
+      namespace: kube-system
+    spec:
+      tls:
+      - hosts:
+        - dashboard.mayocase.com
+        secretName: ingress-secret
+      rules:
+      - host: dashboard.mayocase.com
+        http:
+          paths:
+          - backend:
+              serviceName: kubernetes-dashboard
+              servicePort: 80
+    [root@master yaml_ingress]# kubectl create -f dashboard-ingress-tls.yml 
+    ingress "dashboard-ingress" created
+    [root@master yaml_ingress]# 
+
+注意：一个 Ingress 只能使用一个 secret(secretName 段只能有一个)，也就是说只能用一个证书，更直白的说就是如果你在一个 Ingress 中配置了多个域名，那么使用 TLS 的话必须保证证书支持该 Ingress 下所有域名；并且这个 secretName 一定要放在上面域名列表最后位置，否则会报错 did not find expected key 无法创建；同时上面的 hosts 段下域名必须跟下面的 rules 中完全匹配
+
+更需要注意一点：之所以这里单独开一段就是因为有大坑；Kubernetes Ingress 默认情况下，当你不配置证书时，会默认给你一个 TLS 证书的，也就是说你 Ingress 中配置错了，比如写了2个 secretName、或者 hosts 段中缺了某个域名，那么对于写了多个 secretName 的情况，所有域名全会走默认证书；对于 hosts 缺了某个域名的情况，缺失的域名将会走默认证书，部署时一定要验证一下证书，不能 “有了就行”；更新 Ingress 证书可能需要等一段时间才会生效
+
+注意：部署 TLS 后 80 端口会自动重定向到 443，
+http://dashboard.mayocase.com/
+https://dashboard.mayocase.com/
+
+重做证书：
+
+    kubectl delete -f dashboard-ingress-tls.yml 
+    kubectl delete secret tls ingress-secret
+
+删除cert目录下的所有文件
+从头再做一遍。
+
+
+
