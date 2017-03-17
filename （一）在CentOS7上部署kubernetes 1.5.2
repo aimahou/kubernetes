@@ -1,0 +1,675 @@
+#1.1概述
+##1.1.1架构
+k8smaster  安装etcd，kubernetes-server/client
+k8snode1   安装docker,kubernetes-node/client，flannel
+k8snode2   安装docker,kubernetes-node/client，flannel
+
+#1.2环境准备：
+
+##1.2.1操作系统
+系统“基础设施服务器”模式安装,
+升级所有包同时也升级软件和系统内核
+
+    [root@all ~]# yum -y update
+
+yum -y upgrade只升级所有包，不升级软件和系统内核
+##1.2.2域名解析配置
+
+    [root@all ~]# cat <<EOF >> /etc/hosts
+    172.16.160.205  k8smaster
+    172.16.160.206  k8snode1
+    172.16.160.207  k8snode2
+    61.91.161.217 google.com
+    61.91.161.217 www.gcr.io
+    61.91.161.217 console.cloud.google.com
+    61.91.161.217 storage.googleapis.com
+    61.91.161.217 gcr.io      
+    EOF
+
+在国内，你可能需要指定gcr.io的host，如不指定你需要手动下载google-containers. 如何下载其他文档说的方法挺多
+
+##1.2.3校对时间
+
+    [root@all ~]# ntpdate ntp1.aliyun.com &&hwclock -w
+    23 Feb 13:21:45 ntpdate[10658]: adjust time server 182.92.12.11 offset 0.010341 sec
+
+##1.2.4关闭selinux及防火墙
+
+    [root@all ~]# sed -i s'/SELINUX=enforcing/SELINUX=disabled/g' /etc/sysconfig/selinux
+    [root@all ~]# systemctl disable firewalld; systemctl stop firewalld
+    Removed symlink /etc/systemd/system/dbus-org.fedoraproject.FirewallD1.service.
+    Removed symlink /etc/systemd/system/basic.target.wants/firewalld.service.
+
+##1.2.5重启服务器
+
+    [root@all ~]# reboot
+
+
+
+#1.3 ETCD服务安装
+首先使用工具下载这里的所有的rpm包
+https://cbs.centos.org/repos/virt7-docker-common-candidate/x86_64/os/Packages/ ，然后执行:
+把下载的所有RPM包放到/data/softs/localyum目录下。
+这些安装包，是用来安装kubernetes etcd flannel docker的
+
+    [root@all ~]# yum install -y createrepo
+    [root@all ~]# cd /data/softs/
+    [root@all softs]# createrepo -v localyum
+    
+    [root@kubenode1 softs]# cat <<EOF > /etc/yum.repos.d/local.repo
+    [local]
+    name=local
+    baseurl=file:///data/softs/localyum
+    enabled=1
+    gpgcheck=0
+    EOF
+    [root@all softs]# yum clean all
+    [root@all softs]# yum makecache
+    
+    [root@all softs]# yum install etcd -y
+    [root@all softs]# mv /etc/etcd/etcd.conf /etc/etcd/etcd.conf.bak
+master节点
+
+    [root@k8smaster softs]# vi /etc/etcd/etcd.conf 
+    ETCD_NAME=etcdmaster
+    ETCD_DATA_DIR="/var/lib/etcd/etcd-master.etcd"
+    ETCD_LISTEN_PEER_URLS="http://172.16.160.205:2380"
+    ETCD_LISTEN_CLIENT_URLS="http://172.16.160.205:2379,http://127.0.0.1:2379"
+    ETCD_INITIAL_ADVERTISE_PEER_URLS="http://172.16.160.205:2380"
+    ETCD_INITIAL_CLUSTER="etcdmaster=http://172.16.160.205:2380,etcdnode1=http://172.16.160.206:2380,etcdnode2=http://172.16.160.207:2380"
+    ETCD_INITIAL_CLUSTER_STATE="new"
+    ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster-00"
+    ETCD_ADVERTISE_CLIENT_URLS="http://172.16.160.205:2379"
+
+node节点1
+
+    [root@k8snode1 softs]# vi /etc/etcd/etcd.conf 
+    ETCD_NAME=etcdnode1
+    ETCD_DATA_DIR="/var/lib/etcd/etcd-master.etcd"
+    ETCD_LISTEN_PEER_URLS="http://172.16.160.206:2380"
+    ETCD_LISTEN_CLIENT_URLS="http://172.16.160.206:2379,http://127.0.0.1:2379"
+    ETCD_INITIAL_ADVERTISE_PEER_URLS="http://172.16.160.206:2380"
+    ETCD_INITIAL_CLUSTER="etcdmaster=http://172.16.160.205:2380,etcdnode1=http://172.16.160.206:2380,etcdnode2=http://172.16.160.207:2380"
+    ETCD_INITIAL_CLUSTER_STATE="new"
+    ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster-00"
+    ETCD_ADVERTISE_CLIENT_URLS="http://172.16.160.206:2379"
+
+node节点2
+
+    [root@k8snode2 softs]# vi /etc/etcd/etcd.conf 
+    ETCD_NAME=etcdnode2
+    ETCD_DATA_DIR="/var/lib/etcd/etcd-master.etcd"
+    ETCD_LISTEN_PEER_URLS="http://172.16.160.207:2380"
+    ETCD_LISTEN_CLIENT_URLS="http://172.16.160.207:2379,http://127.0.0.1:2379"
+    ETCD_INITIAL_ADVERTISE_PEER_URLS="http://172.16.160.207:2380"
+    ETCD_INITIAL_CLUSTER="etcdmaster=http://172.16.160.205:2380,etcdnode1=http://172.16.160.206:2380,etcdnode2=http://172.16.160.207:2380"
+    ETCD_INITIAL_CLUSTER_STATE="new"
+    ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster-00"
+    ETCD_ADVERTISE_CLIENT_URLS="http://172.16.160.207:2379"
+
+服务启动文件
+
+    [root@all softs]# mv /usr/lib/systemd/system/etcd.service  /usr/lib/systemd/system/etcd.service.bak
+    [root@all softs]# vi /usr/lib/systemd/system/etcd.service
+    [Unit]
+    Description=Etcd Server
+    After=network.target
+    After=network-online.target
+    Wants=network-online.target
+    
+    [Service]
+    Type=notify
+    WorkingDirectory=/var/lib/etcd/
+    EnvironmentFile=-/etc/etcd/etcd.conf
+    User=etcd
+    
+    ExecStart=/bin/bash -c "GOMAXPROCS=$(nproc) /usr/bin/etcd --name=\"${ETCD_NAME}\" \
+                                                              --data-dir=\"${ETCD_DATA_DIR}\" \
+                                                              --listen-peer-urls=\"${ETCD_LISTEN_PEER_URLS}\" \
+                                                              --listen-client-urls=\"${ETCD_LISTEN_CLIENT_URLS}\" \
+                                                              --advertise-client-urls=\"${ETCD_ADVERTISE_CLIENT_URLS}\" \
+                                                              --initial-cluster-token=\"${ETCD_INITIAL_CLUSTER_TOKEN}\" \
+                                                              --initial-cluster=\"${ETCD_INITIAL_CLUSTER}\" \
+                                                              --initial-cluster-state=\"${ETCD_INITIAL_CLUSTER_STATE}\""
+    
+    Restart=on-failure
+    LimitNOFILE=65536
+    
+    [Install]
+    WantedBy=multi-user.target
+
+
+三台服务器全部运行并测试：
+
+    [root@all softs]# systemctl enable etcd && systemctl restart etcd && systemctl status etcd
+    Created symlink from /etc/systemd/system/multi-user.target.wants/etcd.service to /usr/lib/systemd/system/etcd.service.
+    ● etcd.service - Etcd Server
+       Loaded: loaded (/usr/lib/systemd/system/etcd.service; enabled; vendor preset: disabled)
+       Active: active (running) since 一 2017-02-27 10:17:11 CST; 8ms ago
+     Main PID: 4788 (etcd)
+       CGroup: /system.slice/etcd.service
+               └─4788 /usr/bin/etcd --name=etcdnode2 --data-dir=/var/lib/etcd/etcd-master.etcd --listen-peer-urls=http://172.16.160.207:2380 --listen-...
+    
+    2月 27 10:17:11 k8snode2 etcd[4788]: 7eccc73b94e5aaea became follower at term 20
+    2月 27 10:17:11 k8snode2 etcd[4788]: raft.node: 7eccc73b94e5aaea elected leader 48e928c68a0c1cd6 at term 20
+    2月 27 10:17:11 k8snode2 etcd[4788]: set the initial cluster version to 2.3
+    2月 27 10:17:11 k8snode2 etcd[4788]: enabled capabilities for version 2.3
+    2月 27 10:17:11 k8snode2 etcd[4788]: published {Name:etcdnode2 ClientURLs:[http://172.16.160.207:2379]} to cluster adde062edab1afba
+    2月 27 10:17:11 k8snode2 etcd[4788]: ready to serve client requests
+    2月 27 10:17:11 k8snode2 etcd[4788]: ready to serve client requests
+    2月 27 10:17:11 k8snode2 etcd[4788]: serving insecure client requests on 172.16.160.207:2379, this is strongly discouraged!
+    2月 27 10:17:11 k8snode2 etcd[4788]: serving insecure client requests on 127.0.0.1:2379, this is strongly discouraged!
+    2月 27 10:17:11 k8snode2 systemd[1]: Started Etcd Server.
+
+查看etcd成员列表，可以看出172.16.160.205现在是leader，可以试着关闭第一台的etcd服务，领导角色会变成另外一台。
+
+    [root@all softs]# etcdctl member list
+    48e928c68a0c1cd6: name=etcdmaster peerURLs=http://172.16.160.205:2380 clientURLs=http://172.16.160.205:2379 isLeader=true
+    7eccc73b94e5aaea: name=etcdnode2 peerURLs=http://172.16.160.207:2380 clientURLs=http://172.16.160.207:2379 isLeader=false
+    d7378dd58f633a96: name=etcdnode1 peerURLs=http://172.16.160.206:2380 clientURLs=http://172.16.160.206:2379 isLeader=false
+
+查看etcd的健康情况，是否存活。
+
+    [root@all softs]# etcdctl cluster-health
+    member 48e928c68a0c1cd6 is healthy: got healthy result from http://172.16.160.205:2379
+    member 7eccc73b94e5aaea is healthy: got healthy result from http://172.16.160.207:2379
+    member d7378dd58f633a96 is healthy: got healthy result from http://172.16.160.206:2379
+    cluster is healthy
+
+[root@k8smaster softs]# 
+
+    [root@all softs]# curl -L http://172.16.160.205:2379/version
+    {"etcdserver":"3.0.15","etcdcluster":"3.0.0"}
+    [root@all softs]# curl -L http://172.16.160.206:2379/version
+    {"etcdserver":"3.0.15","etcdcluster":"3.0.0"} 
+    [root@all softs]# curl -L http://172.16.160.207:2379/version
+    {"etcdserver":"3.0.15","etcdcluster":"3.0.0"}
+
+旧的文档一般是使用4012端口，新版本使用2379端口
+
+#1.4 安装 kubernetes
+##1.4.1 安装 kubernetes-master
+k8smaster节点
+
+    [root@all softs]# yum list kubernetes*
+    已加载插件：fastestmirror, langpacks
+    Loading mirror speeds from cached hostfile
+     * base: mirrors.163.com
+     * extras: mirrors.163.com
+     * updates: mirrors.163.com
+    可安装的软件包
+    kubernetes.x86_64                                                            1.5.2-2.el7                                                   local
+    kubernetes-client.x86_64                                                     1.5.2-2.el7                                                   local
+    kubernetes-master.x86_64                                                     1.5.2-2.el7                                                   local
+    kubernetes-node.x86_64                                                       1.5.2-2.el7                                                   local
+    kubernetes-unit-test.x86_64                                                  1.5.2-2.el7                                                   local
+    
+    [root@k8smaster softs]# yum install -y kubernetes-master
+
+一般不用修改kube-apiserver.service服务启动文件
+
+    [root@k8smaster softs]# cat /usr/lib/systemd/system/kube-apiserver.service
+    [Unit]
+    Description=Kubernetes API Server
+    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+    After=network.target
+    After=etcd.service
+    
+    [Service]
+    EnvironmentFile=-/etc/kubernetes/config
+    EnvironmentFile=-/etc/kubernetes/apiserver
+    User=kube
+    ExecStart=/usr/bin/kube-apiserver \
+                $KUBE_LOGTOSTDERR \
+                $KUBE_LOG_LEVEL \
+                $KUBE_ETCD_SERVERS \
+                $KUBE_API_ADDRESS \
+                $KUBE_API_PORT \
+                $KUBELET_PORT \
+                $KUBE_ALLOW_PRIV \
+                $KUBE_SERVICE_ADDRESSES \
+                $KUBE_ADMISSION_CONTROL \
+                $KUBE_API_ARGS
+    Restart=on-failure
+    Type=notify
+    LimitNOFILE=65536
+    
+    [Install]
+    WantedBy=multi-user.target
+
+[root@k8smaster softs]# 
+
+
+    [root@k8smaster softs]# mv /etc/kubernetes/config /etc/kubernetes/config.bak
+    [root@k8smaster softs]# vi /etc/kubernetes/config 
+    KUBE_LOGTOSTDERR="--logtostderr=true"
+    KUBE_LOG_LEVEL="--v=0"
+    KUBE_ALLOW_PRIV="--allow-privileged=false"
+    KUBE_MASTER="--master=http://172.16.160.205:8080" 
+    KUBE_ETCD_SERVERS="--etcd-servers=http://172.16.160.205:2379,http://172.16.160.206:2379,http://172.16.160.208:2379" 
+
+KUBE_MASTER是apiserver的监听端口，默认8080，后面的controller-manager、scheduler及kubelet都会用到这个配置
+KUBE_ETCD_SERVERS是etcd服务地址，前面已经启动了etcd服务
+
+
+    [root@k8smaster softs]# mv /etc/kubernetes/apiserver  /etc/kubernetes/apiserver.bak
+    [root@k8smaster softs]# vi /etc/kubernetes/apiserver
+    #KUBE_API_ADDRESS="--insecure-bind-address=127.0.0.1"
+    KUBE_API_ADDRESS="--insecure-bind-address=0.0.0.0"
+    KUBE_API_PORT="--port=8080"
+    #KUBELET_PORT="--kubelet-port=10250"
+    KUBELET_PORT="--kubelet-port=10250"
+    KUBE_ETCD_SERVERS="--etcd-servers=http://172.16.160.205:2379,http://172.16.160.206:2379,http://172.16.160.207:2379" 
+    KUBE_SERVICE_ADDRESSES="--service-cluster-ip-range=172.20.0.0/16"
+    #KUBE_ADMISSION_CONTROL="--admission-control=NamespaceLifecycle,NamespaceExists,LimitRanger,SecurityContextDeny,ServiceAccount,ResourceQuota"
+    KUBE_ADMISSION_CONTROL="--admission-control=NamespaceLifecycle,NamespaceExists,LimitRanger,SecurityContextDeny,ResourceQuota"
+    KUBE_API_ARGS=""
+
+[root@k8smaster softs]# 
+KUBE_SERVICE_ADDRESSES="--service-cluster-ip-range=172.20.0.0/16"
+后面kubectl get svc查到的k8s service地址，修改后，需要使用kubectl delete svc kubernetes命令删除重建
+这个172.20.0.0/16网段，我是设置跟后面flannel网段不一样的。
+访问ＳＶＣ的ＩＰ加端口（这个就是clusterIP，apiserver配置的ip），
+由clusterIP进入service，经过service的调度进入相应的ＰＯＤ的nginx资源（这个就是PodIP，flannel配置的ip）
+一个是clusterIP，另一个是Pod。一个是虚拟的，一个是实际的
+两个IP网段配置可以一样，但为了防止冲突，最好不用一个网段
+
+    [root@k8smaster softs]# systemctl daemon-reload
+    [root@k8smaster softs]# systemctl restart kube-apiserver
+    [root@k8smaster softs]# systemctl status -l kube-apiserver
+    ● kube-apiserver.service - Kubernetes API Server
+       Loaded: loaded (/usr/lib/systemd/system/kube-apiserver.service; disabled; vendor preset: disabled)
+       Active: active (running) since 一 2017-02-27 10:40:27 CST; 15s ago
+         Docs: https://github.com/GoogleCloudPlatform/kubernetes
+     Main PID: 5003 (kube-apiserver)
+       CGroup: /system.slice/kube-apiserver.service
+               └─5003 /usr/bin/kube-apiserver --logtostderr=true --v=0 --etcd-servers=http://172.16.160.205:2379,http://172.16.160.206:2379,http://172.16.160.207:2379 --insecure-bind-address=0.0.0.0 --port=8080 --kubelet-port=10250 --allow-privileged=false --service-cluster-ip-range=172.20.0.0/16 --admission-control=NamespaceLifecycle,NamespaceExists,LimitRanger,SecurityContextDeny,ResourceQuota
+    
+    2月 27 10:40:27 k8smaster kube-apiserver[5003]: I0227 10:40:27.381254    5003 storage_rbac.go:151] Created clusterrolebinding.rbac.authorization.k8s.io/system:node
+    2月 27 10:40:27 k8smaster kube-apiserver[5003]: I0227 10:40:27.382859    5003 storage_rbac.go:151] Created clusterrolebinding.rbac.authorization.k8s.io/system:node-proxier
+    2月 27 10:40:27 k8smaster kube-apiserver[5003]: I0227 10:40:27.384535    5003 storage_rbac.go:151] Created clusterrolebinding.rbac.authorization.k8s.io/system:controller:replication-controller
+    2月 27 10:40:28 k8smaster kube-apiserver[5003]: I0227 10:40:28.369996    5003 trace.go:61] Trace "Create /api/v1/namespaces/default/services" (started 2017-02-27 10:40:27.364520367 +0800 CST):
+    2月 27 10:40:28 k8smaster kube-apiserver[5003]: [13.302μs] [13.302μs] About to convert to expected version
+    2月 27 10:40:28 k8smaster kube-apiserver[5003]: [75.113μs] [61.811μs] Conversion done
+    2月 27 10:40:28 k8smaster kube-apiserver[5003]: [1.002118737s] [1.002043624s] About to store object in database
+    2月 27 10:40:28 k8smaster kube-apiserver[5003]: [1.005399426s] [3.280689ms] Object stored in database
+    2月 27 10:40:28 k8smaster kube-apiserver[5003]: [1.005405074s] [5.648μs] Self-link added
+    2月 27 10:40:28 k8smaster kube-apiserver[5003]: [1.005446178s] [41.104μs] END
+    [root@k8smaster softs]# 
+    [root@k8smaster softs]# curl -L http://172.16.160.205:8080/healthz
+    ok
+    [root@k8smaster softs]# 
+
+用IE浏览器打开：https://172.16.160.205:6443/swaggerapi/
+
+
+##1.4.2 配置kube-controller-manager
+一般不用修改kube-controller-manager.service文件
+
+    [root@k8smaster softs]# cat /usr/lib/systemd/system/kube-controller-manager.service
+    [Unit]
+    Description=Kubernetes Controller Manager
+    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+    
+    [Service]
+    EnvironmentFile=-/etc/kubernetes/config
+    EnvironmentFile=-/etc/kubernetes/controller-manager
+    User=kube
+    ExecStart=/usr/bin/kube-controller-manager \
+                $KUBE_LOGTOSTDERR \
+                $KUBE_LOG_LEVEL \
+                $KUBE_MASTER \
+                $KUBE_CONTROLLER_MANAGER_ARGS
+    Restart=on-failure
+    LimitNOFILE=65536
+    
+    [Install]
+    WantedBy=multi-user.target
+    [root@k8smaster softs]# 
+
+配置文件/etc/kubernetes/config     前面已经配置过了。
+
+    [root@k8smaster softs]# cat /etc/kubernetes/config
+    KUBE_LOGTOSTDERR="--logtostderr=true"
+    KUBE_LOG_LEVEL="--v=0"
+    KUBE_ALLOW_PRIV="--allow-privileged=false"
+    KUBE_MASTER="--master=http://172.16.160.205:8080"
+    KUBE_ETCD_SERVERS="--etcd-servers=http://172.16.160.205:2379"  
+    [root@k8smaster softs]# 
+
+配置文件/etc/kubernetes/controller-manager       不用修改配置
+
+    [root@k8smaster softs]# cat /etc/kubernetes/controller-manager
+    ###
+    # The following values are used to configure the kubernetes controller-manager
+    # defaults from config and apiserver should be adequate
+    # Add your own!
+    KUBE_CONTROLLER_MANAGER_ARGS=""
+    [root@k8smaster softs]# 
+    
+    [root@k8smaster softs]# systemctl daemon-reload
+    [root@k8smaster softs]# systemctl restart kube-controller-manager
+    [root@k8smaster softs]# systemctl status -l kube-controller-manager
+
+    [root@k8smaster softs]# systemctl status -l kube-controller-manager
+    ● kube-controller-manager.service - Kubernetes Controller Manager
+       Loaded: loaded (/usr/lib/systemd/system/kube-controller-manager.service; disabled; vendor preset: disabled)
+       Active: active (running) since 一 2017-02-27 10:45:15 CST; 13s ago
+         Docs: https://github.com/GoogleCloudPlatform/kubernetes
+     Main PID: 5043 (kube-controller)
+       CGroup: /system.slice/kube-controller-manager.service
+               └─5043 /usr/bin/kube-controller-manager --logtostderr=true --v=0 --master=http://172.16.160.205:8080
+    
+    2月 27 10:45:16 k8smaster kube-controller-manager[5043]: I0227 10:45:16.047816    5043 pet_set.go:146] Starting statefulset controller
+    2月 27 10:45:16 k8smaster kube-controller-manager[5043]: I0227 10:45:16.052062    5043 controllermanager.go:544] Attempting to start certificates, full resource map map[rbac.authorization.k8s.io/v1alpha1:&APIResourceList{GroupVersion:rbac.authorization.k8s.io/v1alpha1,APIResources:[{clusterrolebindings false ClusterRoleBinding} {clusterroles false ClusterRole} {rolebindings true RoleBinding} {roles true Role}],} apps/v1beta1:&APIResourceList{GroupVersion:apps/v1beta1,APIResources:[{statefulsets true StatefulSet} {statefulsets/status true StatefulSet}],} batch/v1:&APIResourceList{GroupVersion:batch/v1,APIResources:[{jobs true Job} {jobs/status true Job}],} policy/v1beta1:&APIResourceList{GroupVersion:policy/v1beta1,APIResources:[{poddisruptionbudgets true PodDisruptionBudget} {poddisruptionbudgets/status true PodDisruptionBudget}],} certificates.k8s.io/v1alpha1:&APIResourceList{GroupVersion:certificates.k8s.io/v1alpha1,APIResources:[{certificatesigningrequests false CertificateSigningRequest} {certificatesigningrequests/approval false CertificateSigningRequest} {certificatesigningrequests/status false CertificateSigningRequest}],} extensions/v1beta1:&APIResourceList{GroupVersion:extensions/v1beta1,APIResources:[{daemonsets true DaemonSet} {daemonsets/status true DaemonSet} {deployments true Deployment} {deployments/rollback true DeploymentRollback} {deployments/scale true Scale} {deployments/status true Deployment} {horizontalpodautoscalers true HorizontalPodAutoscaler} {horizontalpodautoscalers/status true HorizontalPodAutoscaler} {ingresses true Ingress} {ingresses/status true Ingress} {jobs true Job} {jobs/status true Job} {networkpolicies true NetworkPolicy} {replicasets true ReplicaSet} {replicasets/scale true Scale} {replicasets/status true ReplicaSet} {replicationcontrollers true ReplicationControllerDummy} {replicationcontrollers/scale true Scale} {thirdpartyresources false ThirdPartyResource}],} storage.k8s.io/v1beta1:&APIResourceList{GroupVersion:storage.k8s.io/v1beta1,APIResources:[{storageclasses false StorageClass}],} v1:&APIResourceList{GroupVersion:v1,API
+    2月 27 10:45:16 k8smaster kube-controller-manager[5043]: Resources:[{bindings true Binding} {componentstatuses false ComponentStatus} {configmaps true ConfigMap} {endpoints true Endpoints} {events true Event} {limitranges true LimitRange} {namespaces false Namespace} {namespaces/finalize false Namespace} {namespaces/status false Namespace} {nodes false Node} {nodes/proxy false Node} {nodes/status false Node} {persistentvolumeclaims true PersistentVolumeClaim} {persistentvolumeclaims/status true PersistentVolumeClaim} {persistentvolumes false PersistentVolume} {persistentvolumes/status false PersistentVolume} {pods true Pod} {pods/attach true Pod} {pods/binding true Binding} {pods/eviction true Eviction} {pods/exec true Pod} {pods/log true Pod} {pods/portforward true Pod} {pods/proxy true Pod} {pods/status true Pod} {podtemplates true PodTemplate} {replicationcontrollers true ReplicationController} {replicationcontrollers/scale true Scale} {replicationcontrollers/status true ReplicationController} {resourcequotas true ResourceQuota} {resourcequotas/status true ResourceQuota} {secrets true Secret} {serviceaccounts true ServiceAccount} {services true Service} {services/proxy true Service} {services/status true Service}],} authentication.k8s.io/v1beta1:&APIResourceList{GroupVersion:authentication.k8s.io/v1beta1,APIResources:[{tokenreviews false TokenReview}],} authorization.k8s.io/v1beta1:&APIResourceList{GroupVersion:authorization.k8s.io/v1beta1,APIResources:[{localsubjectaccessreviews true LocalSubjectAccessReview} {selfsubjectaccessreviews false SelfSubjectAccessReview} {subjectaccessreviews false SubjectAccessReview}],} autoscaling/v1:&APIResourceList{GroupVersion:autoscaling/v1,APIResources:[{horizontalpodautoscalers true HorizontalPodAutoscaler} {horizontalpodautoscalers/status true HorizontalPodAutoscaler}],}]
+    2月 27 10:45:16 k8smaster kube-controller-manager[5043]: I0227 10:45:16.052192    5043 controllermanager.go:546] Starting certificates.k8s.io/v1alpha1 apis
+    2月 27 10:45:16 k8smaster kube-controller-manager[5043]: I0227 10:45:16.052206    5043 controllermanager.go:548] Starting certificate request controller
+    2月 27 10:45:16 k8smaster kube-controller-manager[5043]: E0227 10:45:16.052427    5043 controllermanager.go:558] Failed to start certificate controller: open /etc/kubernetes/ca/ca.pem: no such file or directory
+    2月 27 10:45:16 k8smaster kube-controller-manager[5043]: I0227 10:45:16.052831    5043 attach_detach_controller.go:204] Starting Attach Detach Controller
+    2月 27 10:45:16 k8smaster kube-controller-manager[5043]: I0227 10:45:16.052879    5043 serviceaccounts_controller.go:120] Starting ServiceAccount controller
+    2月 27 10:45:16 k8smaster kube-controller-manager[5043]: I0227 10:45:16.060008    5043 garbagecollector.go:766] Garbage Collector: Initializing
+    2月 27 10:45:26 k8smaster kube-controller-manager[5043]: I0227 10:45:26.060164    5043 garbagecollector.go:780] Garbage Collector: All monitored resources synced. Proceeding to collect garbage
+    [root@k8smaster softs]# 
+
+
+##1.4.3 配置kube-scheduler
+vi /usr/lib/systemd/system/kube-scheduler.service    不用修改配置
+
+    [root@k8smaster softs]# cat /usr/lib/systemd/system/kube-scheduler.service
+    [Unit]
+    Description=Kubernetes Scheduler Plugin
+    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+    
+    [Service]
+    EnvironmentFile=-/etc/kubernetes/config
+    EnvironmentFile=-/etc/kubernetes/scheduler
+    User=kube
+    ExecStart=/usr/bin/kube-scheduler \
+                $KUBE_LOGTOSTDERR \
+                $KUBE_LOG_LEVEL \
+                $KUBE_MASTER \
+                $KUBE_SCHEDULER_ARGS
+    Restart=on-failure
+    LimitNOFILE=65536
+    
+    [Install]
+    WantedBy=multi-user.target
+
+[root@k8smaster softs]# 
+vi /etc/kubernetes/scheduler    不用修改配置
+
+    [root@k8smaster softs]# cat /etc/kubernetes/scheduler
+    ###
+    # kubernetes scheduler config
+    # default config should be adequate
+    # Add your own!
+    KUBE_SCHEDULER_ARGS=""
+    [root@k8smaster softs]# 
+    
+    [root@k8smaster softs]# systemctl daemon-reload
+    [root@k8smaster softs]# systemctl start kube-scheduler
+    [root@k8smaster softs]# systemctl status -l kube-scheduler
+    ● kube-scheduler.service - Kubernetes Scheduler Plugin
+       Loaded: loaded (/usr/lib/systemd/system/kube-scheduler.service; disabled; vendor preset: disabled)
+       Active: active (running) since 一 2017-02-27 10:47:50 CST; 3s ago
+         Docs: https://github.com/GoogleCloudPlatform/kubernetes
+     Main PID: 5083 (kube-scheduler)
+       CGroup: /system.slice/kube-scheduler.service
+               └─5083 /usr/bin/kube-scheduler --logtostderr=true --v=0 --master=http://172.16.160.205:8080
+    
+    2月 27 10:47:50 k8smaster systemd[1]: Started Kubernetes Scheduler Plugin.
+    2月 27 10:47:50 k8smaster systemd[1]: Starting Kubernetes Scheduler Plugin...
+    2月 27 10:47:50 k8smaster kube-scheduler[5083]: I0227 10:47:50.890687    5083 leaderelection.go:188] sucessfully acquired lease kube-system/kube-scheduler
+    2月 27 10:47:50 k8smaster kube-scheduler[5083]: I0227 10:47:50.890864    5083 event.go:217] Event(api.ObjectReference{Kind:"Endpoints", Namespace:"kube-system", Name:"kube-scheduler", UID:"21360236-fc97-11e6-9d54-005056b1ced4", APIVersion:"v1", ResourceVersion:"112", FieldPath:""}): type: 'Normal' reason: 'LeaderElection' k8smaster became leader
+    [root@k8smaster softs]# 
+
+查看日志
+
+    [root@k8smaster softs]# tail -f /var/log/messages | grep kube
+    Feb 27 10:45:16 k8smaster kube-controller-manager: I0227 10:45:16.060008    5043 garbagecollector.go:766] Garbage Collector: Initializing
+    Feb 27 10:45:26 k8smaster kube-controller-manager: I0227 10:45:26.060164    5043 garbagecollector.go:780] Garbage Collector: All monitored resources synced. Proceeding to collect garbage
+    Feb 27 10:47:50 k8smaster kube-scheduler: I0227 10:47:50.890687    5083 leaderelection.go:188] sucessfully acquired lease kube-system/kube-scheduler
+    Feb 27 10:47:50 k8smaster kube-scheduler: I0227 10:47:50.890864    5083 event.go:217] Event(api.ObjectReference{Kind:"Endpoints", Namespace:"kube-system", Name:"kube-scheduler", UID:"21360236-fc97-11e6-9d54-005056b1ced4", APIVersion:"v1", ResourceVersion:"112", FieldPath:""}): type: 'Normal' reason: 'LeaderElection' k8smaster became leader
+
+#1.5 Node节点部署
+##1.5.1安装docker
+安装kubernetes-node的时候会自动安装docker,如果docker安装失败，可以按以下方法自己安装
+
+    [root@k8snode softs]# yum install kubernetes-node -y
+
+以下方法是安装docker-engine而不是docker,docker-selinux和docker-common是docker的依赖包会与docker-engine冲突，所以安装docker-engine前需卸载
+
+    [root@k8snode softs]# tee /etc/yum.repos.d/docker.repo <<-'EOF'
+    [dockerrepo]
+    name=Docker Repository
+    baseurl=https://yum.dockerproject.org/repo/main/centos/$releasever/
+    enabled=1
+    gpgcheck=1
+    gpgkey=https://yum.dockerproject.org/gpg
+    EOF
+    [root@k8snode softs]# yum remove docker-selinux -y
+    [root@k8snode softs]# yum remove docker-common -y
+    [root@k8snode softs]# yum install docker-engine -y
+    [root@k8snode softs]# systemctl start docker
+    [root@k8snode1 softs]# systemctl enable docker.service
+    Created symlink from /etc/systemd/system/multi-user.target.wants/docker.service to /usr/lib/systemd/system/docker.service.
+    [root@k8snode softs]# systemctl status docker
+    ● docker.service - Docker Application Container Engine
+       Loaded: loaded (/usr/lib/systemd/system/docker.service; enabled; vendor preset: disabled)
+       Active: active (running) since 一 2017-02-27 13:12:18 CST; 51s ago
+         Docs: https://docs.docker.com
+     Main PID: 24961 (dockerd)
+       CGroup: /system.slice/docker.service
+               ├─24961 /usr/bin/dockerd
+               └─24967 docker-containerd -l unix:///var/run/docker/libcontainerd/docker-containerd.sock --metrics-interval=0 --start-timeout 2m -...
+    
+    2月 27 13:12:18 k8snode1 dockerd[24961]: time="2017-02-27T13:12:18.255058644+08:00" level=warning msg="overlay: the backing xfs filesystem i...
+    2月 27 13:12:18 k8snode1 dockerd[24961]: time="2017-02-27T13:12:18.283451326+08:00" level=info msg="Graph migration to content-addre...seconds"
+    2月 27 13:12:18 k8snode1 dockerd[24961]: time="2017-02-27T13:12:18.284062939+08:00" level=info msg="Loading containers: start."
+    2月 27 13:12:18 k8snode1 dockerd[24961]: time="2017-02-27T13:12:18.333641105+08:00" level=info msg="Firewalld running: false"
+    2月 27 13:12:18 k8snode1 dockerd[24961]: time="2017-02-27T13:12:18.380404691+08:00" level=info msg="Default bridge (docker0) is assi...address"
+    2月 27 13:12:18 k8snode1 dockerd[24961]: time="2017-02-27T13:12:18.413239646+08:00" level=info msg="Loading containers: done."
+    2月 27 13:12:18 k8snode1 dockerd[24961]: time="2017-02-27T13:12:18.422172088+08:00" level=info msg="Daemon has completed initialization"
+    2月 27 13:12:18 k8snode1 dockerd[24961]: time="2017-02-27T13:12:18.422206050+08:00" level=info msg="Docker daemon" commit=092cba3 gr...n=1.13.1
+    2月 27 13:12:18 k8snode1 dockerd[24961]: time="2017-02-27T13:12:18.429110625+08:00" level=info msg="API listen on /var/run/docker.sock"
+    2月 27 13:12:18 k8snode1 systemd[1]: Started Docker Application Container Engine.
+    Hint: Some lines were ellipsized, use -l to show in full.
+    [root@k8snode1 softs]# 
+
+##1.5.2 配置kube-proxy
+
+    [root@k8snode softs]# mv /etc/kubernetes/config /etc/kubernetes/config.bak
+
+三台虚拟机一样的配置
+
+    [root@k8snode softs]# vi /etc/kubernetes/config 
+    KUBE_LOGTOSTDERR="--logtostderr=true"
+    KUBE_LOG_LEVEL="--v=0"
+    KUBE_ALLOW_PRIV="--allow-privileged=false"
+    KUBE_MASTER="--master=http://172.16.160.205:8080"
+    KUBE_ETCD_SERVERS="--etcd-servers=http://172.16.160.205:2379"  
+
+配置文件/usr/lib/systemd/system/kube-proxy.service      不需要修改配置
+
+    [root@k8snode softs]# cat /usr/lib/systemd/system/kube-proxy.service
+    [Unit]
+    Description=Kubernetes Kube-Proxy Server
+    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+    After=network.target
+    
+    [Service]
+    EnvironmentFile=-/etc/kubernetes/config
+    EnvironmentFile=-/etc/kubernetes/proxy
+    ExecStart=/usr/bin/kube-proxy \
+                $KUBE_LOGTOSTDERR \
+                $KUBE_LOG_LEVEL \
+                $KUBE_MASTER \
+                $KUBE_PROXY_ARGS
+    Restart=on-failure
+    LimitNOFILE=65536
+    
+    [Install]
+    WantedBy=multi-user.target
+    [root@k8snode softs]# 
+
+配置文件/etc/kubernetes/proxy    不需要修改配置
+
+    [root@k8snode softs]# cat /etc/kubernetes/proxy
+    ###
+    # kubernetes proxy config
+    # default config should be adequate
+    # Add your own!
+    KUBE_PROXY_ARGS=""
+    [root@k8snode softs]# 
+    
+    [root@k8snode softs]# systemctl daemon-reload
+    [root@k8snode softs]# systemctl restart kube-proxy
+    [root@k8snode softs]# systemctl enable kube-proxy
+    [root@k8snode softs]# systemctl status -l kube-proxy
+    ● kube-proxy.service - Kubernetes Kube-Proxy Server
+       Loaded: loaded (/usr/lib/systemd/system/kube-proxy.service; disabled; vendor preset: disabled)
+       Active: active (running) since 一 2017-02-27 10:55:53 CST; 3s ago
+         Docs: https://github.com/GoogleCloudPlatform/kubernetes
+     Main PID: 4972 (kube-proxy)
+       Memory: 14.9M
+       CGroup: /system.slice/kube-proxy.service
+               └─4972 /usr/bin/kube-proxy --logtostderr=true --v=0 --master=http://172.16.160.205:8080
+    
+    2月 27 10:55:53 k8snode1 kube-proxy[4972]: E0227 10:55:53.721688    4972 server.go:421] Can't get Node "k8snode1", assuming iptables proxy, err: nodes "k8snode1" not found
+    2月 27 10:55:53 k8snode1 kube-proxy[4972]: I0227 10:55:53.723134    4972 server.go:215] Using iptables Proxier.
+    2月 27 10:55:53 k8snode1 kube-proxy[4972]: W0227 10:55:53.723793    4972 server.go:468] Failed to retrieve node info: nodes "k8snode1" not found
+    2月 27 10:55:53 k8snode1 kube-proxy[4972]: W0227 10:55:53.723843    4972 proxier.go:249] invalid nodeIP, initialize kube-proxy with 127.0.0.1 as nodeIP
+    2月 27 10:55:53 k8snode1 kube-proxy[4972]: W0227 10:55:53.723849    4972 proxier.go:254] clusterCIDR not specified, unable to distinguish between internal and external traffic
+    2月 27 10:55:53 k8snode1 kube-proxy[4972]: I0227 10:55:53.723864    4972 server.go:227] Tearing down userspace rules.
+    2月 27 10:55:53 k8snode1 kube-proxy[4972]: I0227 10:55:53.793750    4972 conntrack.go:81] Set sysctl 'net/netfilter/nf_conntrack_max' to 131072
+    2月 27 10:55:53 k8snode1 kube-proxy[4972]: I0227 10:55:53.794288    4972 conntrack.go:66] Setting conntrack hashsize to 32768
+    2月 27 10:55:53 k8snode1 kube-proxy[4972]: I0227 10:55:53.794519    4972 conntrack.go:81] Set sysctl 'net/netfilter/nf_conntrack_tcp_timeout_established' to 86400
+    2月 27 10:55:53 k8snode1 kube-proxy[4972]: I0227 10:55:53.794552    4972 conntrack.go:81] Set sysctl 'net/netfilter/nf_conntrack_tcp_timeout_close_wait' to 3600
+    [root@k8snode1 softs]# 
+
+
+##1.5.3 配置kubelet
+
+配置文件/usr/lib/systemd/system/kubelet.service    不需要修改配置
+
+    [root@k8snode softs]# cat /usr/lib/systemd/system/kubelet.service
+    [Unit]
+    Description=Kubernetes Kubelet Server
+    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+    After=docker.service
+    Requires=docker.service
+    
+    [Service]
+    WorkingDirectory=/var/lib/kubelet
+    EnvironmentFile=-/etc/kubernetes/config
+    EnvironmentFile=-/etc/kubernetes/kubelet
+    ExecStart=/usr/bin/kubelet \
+                $KUBE_LOGTOSTDERR \
+                $KUBE_LOG_LEVEL \
+                $KUBELET_API_SERVER \
+                $KUBELET_ADDRESS \
+                $KUBELET_PORT \
+                $KUBELET_HOSTNAME \
+                $KUBE_ALLOW_PRIV \
+                $KUBELET_ARGS
+    Restart=on-failure
+    KillMode=process
+    
+    [Install]
+    WantedBy=multi-user.target
+    [root@k8snode softs]# 
+
+KUBELET_API_SERVER指定apiserver地址和端口
+
+    [root@k8snode softs]# mv /etc/kubernetes/kubelet /etc/kubernetes/kubelet.bak
+    [root@k8snode1 softs]# vi /etc/kubernetes/kubelet
+    #KUBELET_ADDRESS="--address=127.0.0.1"
+    KUBELET_ADDRESS="--address=0.0.0.0"
+    # KUBELET_PORT="--port=10250"
+    #KUBELET_HOSTNAME="--hostname-override=127.0.0.1"
+    KUBELET_HOSTNAME="--hostname-override=k8snode1" 
+    #KUBELET_API_SERVER="--api-servers=http://127.0.0.1:8080"
+    KUBELET_API_SERVER="--api-servers=http://172.16.160.205:8080"
+    KUBELET_POD_INFRA_CONTAINER="--pod-infra-container-image=registry.access.redhat.com/rhel7/pod-infrastructure:latest"
+    KUBELET_ARGS=""
+    
+    [root@k8snode2 softs]# vi /etc/kubernetes/kubelet
+    #KUBELET_ADDRESS="--address=127.0.0.1"
+    KUBELET_ADDRESS="--address=0.0.0.0"
+    # KUBELET_PORT="--port=10250"
+    #KUBELET_HOSTNAME="--hostname-override=127.0.0.1"
+    KUBELET_HOSTNAME="--hostname-override=k8snode2" 
+    #KUBELET_API_SERVER="--api-servers=http://127.0.0.1:8080"
+    KUBELET_API_SERVER="--api-servers=http://172.16.160.205:8080"
+    KUBELET_POD_INFRA_CONTAINER="--pod-infra-container-image=registry.access.redhat.com/rhel7/pod-infrastructure:latest"
+    KUBELET_ARGS=""
+
+注意上面KUBELET_HOSTNAME，每个NODE节点取的名称自己决定
+
+    [root@k8snode softs]# systemctl daemon-reload
+    [root@k8snode softs]# systemctl restart kubelet
+    [root@k8snode softs]# systemctl enable kubelet
+    [root@k8snode softs]# systemctl status -l kubelet
+
+kubelet启动之前应确保docker服务已经启动，否则会报以下错误，
+
+    [root@k8snode1 softs]# systemctl restart kubelet
+    Failed to restart kubelet.service: Unit not found.
+
+/etc/kubernetes/kubelet配置文件中如果是KUBELET_API_SERVER="--api-servers=http://127.0.0.1:8080"会报错
+
+    [root@k8snode2 softs]# systemctl status -l kubelet
+    ● kubelet.service - Kubernetes Kubelet Server
+       Loaded: loaded (/usr/lib/systemd/system/kubelet.service; disabled; vendor preset: disabled)
+       Active: active (running) since 一 2017-02-27 13:00:40 CST; 6s ago
+         Docs: https://github.com/GoogleCloudPlatform/kubernetes
+     Main PID: 5781 (kubelet)
+       Memory: 28.0M
+       CGroup: /system.slice/kubelet.service
+               ├─5781 /usr/bin/kubelet --logtostderr=true --v=0 --api-servers=http://127.0.0.1:8080 --address=127.0.0.1 --hostname-override=127.0.0.1 --allow-privileged=false
+               └─5826 journalctl -k -f
+    
+    2月 27 13:00:43 k8snode2 kubelet[5781]: I0227 13:00:43.733065    5781 kubelet_node_status.go:204] Setting node annotation to enable volume controller attach/detach
+    2月 27 13:00:43 k8snode2 kubelet[5781]: I0227 13:00:43.733720    5781 kubelet_node_status.go:74] Attempting to register node 127.0.0.1
+    2月 27 13:00:43 k8snode2 kubelet[5781]: E0227 13:00:43.733939    5781 kubelet_node_status.go:98] Unable to register node "127.0.0.1" with API server: Post http://127.0.0.1:8080/api/v1/nodes: dial tcp 127.0.0.1:8080: getsockopt: connection refused
+    2月 27 13:00:43 k8snode2 kubelet[5781]: E0227 13:00:43.741680    5781 event.go:208] Unable to write event: 'Post http://127.0.0.1:8080/api/v1/namespaces/default/events: dial tcp 127.0.0.1:8080: getsockopt: connection refused' (may retry after sleeping)
+    2月 27 13:00:44 k8snode2 kubelet[5781]: E0227 13:00:44.614238    5781 reflector.go:188] pkg/kubelet/kubelet.go:386: Failed to list *api.Node: Get http://127.0.0.1:8080/api/v1/nodes?fieldSelector=metadata.name%3D127.0.0.1&resourceVersion=0: dial tcp 127.0.0.1:8080: getsockopt: connection refused
+    2月 27 13:00:44 k8snode2 kubelet[5781]: E0227 13:00:44.614377    5781 reflector.go:188] pkg/kubelet/kubelet.go:378: Failed to list *api.Service: Get http://127.0.0.1:8080/api/v1/services?resourceVersion=0: dial tcp 127.0.0.1:8080: getsockopt: connection refused
+    2月 27 13:00:44 k8snode2 kubelet[5781]: E0227 13:00:44.615416    5781 reflector.go:188] pkg/kubelet/config/apiserver.go:44: Failed to list *api.Pod: Get http://127.0.0.1:8080/api/v1/pods?fieldSelector=spec.nodeName%3D127.0.0.1&resourceVersion=0: dial tcp 127.0.0.1:8080: getsockopt: connection refused
+    2月 27 13:00:45 k8snode2 kubelet[5781]: E0227 13:00:45.614806    5781 reflector.go:188] pkg/kubelet/kubelet.go:378: Failed to list *api.Service: Get http://127.0.0.1:8080/api/v1/services?resourceVersion=0: dial tcp 127.0.0.1:8080: getsockopt: connection refused
+    2月 27 13:00:45 k8snode2 kubelet[5781]: E0227 13:00:45.614881    5781 reflector.go:188] pkg/kubelet/kubelet.go:386: Failed to list *api.Node: Get http://127.0.0.1:8080/api/v1/nodes?fieldSelector=metadata.name%3D127.0.0.1&resourceVersion=0: dial tcp 127.0.0.1:8080: getsockopt: connection refused
+    2月 27 13:00:45 k8snode2 kubelet[5781]: E0227 13:00:45.615693    5781 reflector.go:188] pkg/kubelet/config/apiserver.go:44: Failed to list *api.Pod: Get http://127.0.0.1:8080/api/v1/pods?fieldSelector=spec.nodeName%3D127.0.0.1&resourceVersion=0: dial tcp 127.0.0.1:8080: getsockopt: connection refused
+
+/etc/kubernetes/kubelet配置文件中如果是KUBELET_API_SERVER="--api-servers=http://172.16.160.205:8080"才是正确的
+
+    [root@k8snode2 softs]# systemctl status -l kubelet
+    ● kubelet.service - Kubernetes Kubelet Server
+       Loaded: loaded (/usr/lib/systemd/system/kubelet.service; disabled; vendor preset: disabled)
+       Active: active (running) since 一 2017-02-27 13:01:32 CST; 5s ago
+         Docs: https://github.com/GoogleCloudPlatform/kubernetes
+     Main PID: 6419 (kubelet)
+       Memory: 26.3M
+       CGroup: /system.slice/kubelet.service
+               ├─5826 journalctl -k -f
+               ├─6419 /usr/bin/kubelet --logtostderr=true --v=0 --api-servers=http://172.16.160.205:8080 --address=0.0.0.0 --hostname-override=k8snode1 --allow-privileged=false
+               └─6464 journalctl -k -f
+    
+    2月 27 13:01:32 k8snode2 kubelet[6419]: W0227 13:01:32.696359    6419 manager.go:247] Registration of the rkt container factory failed: unable to communicate with Rkt api service: rkt: cannot tcp Dial rkt api service: dial tcp [::1]:15441: getsockopt: connection refused
+    2月 27 13:01:32 k8snode2 kubelet[6419]: I0227 13:01:32.696366    6419 factory.go:54] Registering systemd factory
+    2月 27 13:01:32 k8snode2 kubelet[6419]: I0227 13:01:32.696477    6419 factory.go:86] Registering Raw factory
+    2月 27 13:01:32 k8snode2 kubelet[6419]: I0227 13:01:32.696591    6419 manager.go:1106] Started watching for new ooms in manager
+    2月 27 13:01:32 k8snode2 kubelet[6419]: I0227 13:01:32.699243    6419 oomparser.go:185] oomparser using systemd
+    2月 27 13:01:32 k8snode2 kubelet[6419]: I0227 13:01:32.699877    6419 manager.go:288] Starting recovery of all containers
+    2月 27 13:01:32 k8snode2 kubelet[6419]: I0227 13:01:32.752998    6419 manager.go:293] Recovery completed
+    2月 27 13:01:32 k8snode2 kubelet[6419]: I0227 13:01:32.785967    6419 kubelet_node_status.go:204] Setting node annotation to enable volume controller attach/detach
+    2月 27 13:01:32 k8snode2 kubelet[6419]: I0227 13:01:32.787063    6419 kubelet_node_status.go:74] Attempting to register node k8snode1
+    2月 27 13:01:32 k8snode2 kubelet[6419]: I0227 13:01:32.790142    6419 kubelet_node_status.go:77] Successfully registered node k8snode1
+    [root@k8snode2 softs]# 
+
+kubelet启动后，可以master端查看有几个NODE节点
+
+    [root@k8smaster home]# kubectl get node
+    NAME       STATUS     AGE
+    k8snode1   NotReady   21h
+    k8snode2   NotReady   21h
